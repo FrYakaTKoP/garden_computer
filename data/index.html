@@ -1,0 +1,48 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Tuttli9000 Garden Controller</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="app">
+    <header>
+      <div>
+        <h1>Tuttli9000</h1>
+        <p>Garden controller • AP portal • irrigation automation</p>
+      </div>
+      <button id="refresh">Refresh</button>
+    </header>
+
+    <section class="cards">
+      <article class="card">
+        <h3>Battery</h3>
+        <div id="battery" class="value">-- V</div>
+      </article>
+      <article class="card">
+        <h3>Solar</h3>
+        <div id="solar" class="value">-- W</div>
+      </article>
+      <article class="card">
+        <h3>AP Status</h3>
+        <div id="apstatus" class="value">--</div>
+      </article>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Automation Schedule</h2>
+        <button id="add">Add Entry</button>
+      </div>
+      <div id="tablewrap"></div>
+    </section>
+
+    <section class="panel">
+      <div id="formwrap" style="display:none"></div>
+    </section>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>
