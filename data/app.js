@@ -23,9 +23,11 @@
     }
 
     function renderStatus(data) {
-        document.getElementById('battery').textContent = `${Number(data.batteryV || 0).toFixed(1)} V`;
-        document.getElementById('solar').textContent = `${Number(data.solarW || 0).toFixed(0)} W`;
-        document.getElementById('apstatus').textContent = data.apActive ? `AP active (${data.ssid || 'Tuttli9000'})` : 'AP idle';
+        document.getElementById('battery').textContent = `${Number(data.batteryVoltage || data.batteryV || 0).toFixed(1)} V / ${Number(data.batteryCurrent || 0).toFixed(1)} A`;
+        document.getElementById('solar').textContent = `${Number(data.pvVoltage || 0).toFixed(1)} V / ${Number(data.pvCurrent || 0).toFixed(1)} A`;
+        document.getElementById('load').textContent = `${Number(data.loadVoltage || 0).toFixed(1)} V / ${Number(data.loadCurrent || 0).toFixed(1)} A`;
+        const tracerStatus = data.tracerValid ? 'Connected' : 'Disconnected';
+        document.getElementById('tracerstatus').textContent = tracerStatus;
         const clock = document.getElementById('clock');
         if (data.rtcPresent && data.rtcDisplay) {
             const parts = data.rtcDisplay.split(' ');
@@ -57,9 +59,10 @@
 
     function reload() {
         api('/api/status').then(renderStatus).catch(() => {
-            document.getElementById('battery').textContent = '-- V';
-            document.getElementById('solar').textContent = '-- W';
-            document.getElementById('apstatus').textContent = 'Status unavailable';
+            document.getElementById('battery').textContent = '-- V / -- A';
+            document.getElementById('solar').textContent = '-- V / -- A';
+            document.getElementById('load').textContent = '-- V / -- A';
+            document.getElementById('tracerstatus').textContent = 'Unknown';
         });
 
         api('/api/schedules').then(data => {

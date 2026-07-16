@@ -7,6 +7,7 @@
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <Wire.h>
+#include <HardwareSerial.h>
 
 using namespace fs;
 
@@ -21,11 +22,43 @@ static const int PUMP1_PIN = 16;
 static const int PUMP2_PIN = 17;
 static const int I2C_SDA_PIN = 8;
 static const int I2C_SCL_PIN = 9;
+static const int RS485_DE_PIN = 15;
+static const int RS485_TX_PIN = 17;
+static const int RS485_RX_PIN = 18;
+static const uint8_t MODBUS_SLAVE_ADDRESS = 0x01;
+static const uint32_t MODBUS_BAUD_RATE = 115200;
+static const uint16_t REG_PV_VOLTAGE = 0x3100;
+static const uint16_t REG_PV_CURRENT = 0x3101;
+static const uint16_t REG_BATTERY_VOLTAGE = 0x3104;
+static const uint16_t REG_BATTERY_CURRENT = 0x3105;
+static const uint16_t REG_LOAD_VOLTAGE = 0x310C;
+static const uint16_t REG_LOAD_CURRENT = 0x310D;
 
 static DNSServer dnsServer;
 static AsyncWebServer server(80);
 static Preferences prefs;
 static bool rtcPresent = false;
+static unsigned long lastTracerPollMs = 0;
+
+struct EpeverTracerData
+{
+    bool valid = false;
+    float pvVoltage = 0.0f;
+    float pvCurrent = 0.0f;
+    float batteryVoltage = 0.0f;
+    float batteryCurrent = 0.0f;
+    float loadVoltage = 0.0f;
+    float loadCurrent = 0.0f;
+    float pvPowerWatts = 0.0f;
+    float batteryPowerWatts = 0.0f;
+    float loadPowerWatts = 0.0f;
+    uint16_t batterySoc = 0;
+    uint16_t chargingState = 0;
+    uint16_t loadState = 0;
+    uint16_t errorCode = 0;
+};
+
+static EpeverTracerData tracerData;
 
 struct Ds1307Time
 {
@@ -228,6 +261,136 @@ String formatRtcTimeInput(const Ds1307Time &now)
     char buf[8];
     snprintf(buf, sizeof(buf), "%02u:%02u", now.hour, now.minute);
     return String(buf);
+}
+
+uint16_t modbusCrc16(const uint8_t *data, size_t len)
+{
+    uint16_t crc = 0xFFFF;
+    for (size_t i = 0; i < len; ++i)
+    {
+        crc ^= (uint16_t)data[i];
+        for (int bit = 0; bit < 8; ++bit)
+        {
+            if ((crc & 0x0001) != 0)
+            {
+                crc = (uint16_t)((crc >> 1) ^ 0xA001);
+            }
+            else
+            {
+                crc >>= 1;
+            }
+        }
+    }
+    return crc;
+}
+
+bool modbusReadRegister(uint16_t address, uint16_t &value, uint32_t timeoutMs = 500)
+{
+    uint8_t request[8] = {MODBUS_SLAVE_ADDRESS, 0x03,
+                          (uint8_t)((address >> 8) & 0xFF),
+                          (uint8_t)(address & 0xFF),
+                          0x00, 0x01, 0x00, 0x00};
+    uint16_t crc = modbusCrc16(request, 6);
+    request[6] = (uint8_t)(crc & 0xFF);
+    request[7] = (uint8_t)((crc >> 8) & 0xFF);
+
+    while (Serial1.available())
+        Serial1.read();
+
+    digitalWrite(RS485_DE_PIN, HIGH);
+    Serial1.write(request, sizeof(request));
+    Serial1.flush();
+    digitalWrite(RS485_DE_PIN, LOW);
+    delay(20);
+
+    uint8_t response[64] = {0};
+    size_t index = 0;
+    unsigned long start = millis();
+    while (millis() - start < timeoutMs)
+    {
+        while (Serial1.available() && index < sizeof(response))
+        {
+            response[index++] = (uint8_t)Serial1.read();
+            if (index >= 8)
+                break;
+        }
+        if (index >= 8)
+            break;
+        delay(5);
+    }
+
+    if (index < 8)
+        return false;
+
+    if (response[0] != MODBUS_SLAVE_ADDRESS || response[1] != 0x03)
+        return false;
+
+    uint8_t byteCount = response[2];
+    if (byteCount != 2)
+        return false;
+
+    uint16_t responseCrc = ((uint16_t)response[index - 1] << 8) | response[index - 2];
+    uint16_t calcCrc = modbusCrc16(response, index - 2);
+    if (responseCrc != calcCrc)
+        return false;
+
+    value = ((uint16_t)response[3] << 8) | response[4];
+    return true;
+}
+
+bool readTracerData(EpeverTracerData &data)
+{
+    EpeverTracerData fresh;
+    uint16_t raw = 0;
+
+    if (!modbusReadRegister(REG_PV_VOLTAGE, raw))
+        return false;
+    fresh.pvVoltage = raw / 10.0f;
+
+    if (!modbusReadRegister(REG_PV_CURRENT, raw))
+        return false;
+    fresh.pvCurrent = raw / 10.0f;
+
+    if (!modbusReadRegister(REG_BATTERY_VOLTAGE, raw))
+        return false;
+    fresh.batteryVoltage = raw / 10.0f;
+
+    if (!modbusReadRegister(REG_BATTERY_CURRENT, raw))
+        return false;
+    fresh.batteryCurrent = raw / 10.0f;
+
+    if (!modbusReadRegister(REG_LOAD_VOLTAGE, raw))
+        return false;
+    fresh.loadVoltage = raw / 10.0f;
+
+    if (!modbusReadRegister(REG_LOAD_CURRENT, raw))
+        return false;
+    fresh.loadCurrent = raw / 10.0f;
+
+    fresh.valid = true;
+    data = fresh;
+    return true;
+}
+
+void refreshTracerDataIfNeeded()
+{
+    unsigned long now = millis();
+    if (now - lastTracerPollMs < 3000UL)
+        return;
+
+    lastTracerPollMs = now;
+    static uint32_t tracerFailureCount = 0;
+
+    if (!readTracerData(tracerData))
+    {
+        tracerData.valid = false;
+        if (++tracerFailureCount % 10 == 0)
+            Serial.println("Tracer poll failed");
+    }
+    else
+    {
+        tracerFailureCount = 0;
+    }
 }
 
 bool initRtc()
@@ -463,7 +626,9 @@ if(r->method()==HTTP_GET) r->redirect(String("http://") + apIP.toString() + "/")
 // API handlers
 void apiStatus(AsyncWebServerRequest *request)
 {
-    DynamicJsonDocument doc(256);
+    refreshTracerDataIfNeeded();
+
+    DynamicJsonDocument doc(512);
     String rtcDisplay = "";
     if (rtcPresent)
     {
@@ -472,8 +637,15 @@ void apiStatus(AsyncWebServerRequest *request)
             rtcDisplay = formatRtcDateTime(now);
     }
     doc["uptimeMin"] = millis() / 60000UL;
-    doc["batteryV"] = 12.4;
-    doc["solarW"] = 124.5;
+    doc["batteryV"] = tracerData.valid ? tracerData.batteryVoltage : 0.0f;
+    doc["solarW"] = tracerData.valid ? (tracerData.pvVoltage * tracerData.pvCurrent) : 0.0f;
+    doc["pvVoltage"] = tracerData.valid ? tracerData.pvVoltage : 0.0f;
+    doc["pvCurrent"] = tracerData.valid ? tracerData.pvCurrent : 0.0f;
+    doc["batteryVoltage"] = tracerData.valid ? tracerData.batteryVoltage : 0.0f;
+    doc["batteryCurrent"] = tracerData.valid ? tracerData.batteryCurrent : 0.0f;
+    doc["loadVoltage"] = tracerData.valid ? tracerData.loadVoltage : 0.0f;
+    doc["loadCurrent"] = tracerData.valid ? tracerData.loadCurrent : 0.0f;
+    doc["tracerValid"] = tracerData.valid;
     doc["pump1Active"] = (activeRuns[0].active || activeRuns[1].active);
     doc["pump2Active"] = (activeRuns[2].active || activeRuns[3].active);
     doc["apActive"] = apActive;
@@ -671,15 +843,21 @@ void setup()
     prefs.begin("gc", false);
     loadSchedules();
     initRtc();
+    pinMode(RS485_DE_PIN, OUTPUT);
+    digitalWrite(RS485_DE_PIN, LOW);
+    Serial1.begin(MODBUS_BAUD_RATE, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
+    Serial.printf("RS485 UART1 ready on pins TX=%d RX=%d DE=%d\n", RS485_TX_PIN, RS485_RX_PIN, RS485_DE_PIN);
     setPumpPins();
     startAP();
     setupServerRoutes();
     server.begin();
+    refreshTracerDataIfNeeded();
     Serial.println("Async server started");
 }
 void loop()
 {
     dnsServer.processNextRequest();
+    refreshTracerDataIfNeeded();
     if (apActive && (millis() - apStartMillis > AP_TIMEOUT_MS))
         stopAP();
     static unsigned long lastButton = 0;
