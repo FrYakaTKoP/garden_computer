@@ -6,6 +6,7 @@
 #include <LittleFS.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <Wire.h>
 
 using namespace fs;
 
@@ -18,10 +19,66 @@ static const uint32_t AP_TIMEOUT_MS = 15UL * 60UL * 1000UL;
 static const int RESTART_BUTTON_PIN = 0;
 static const int PUMP1_PIN = 16;
 static const int PUMP2_PIN = 17;
+static const int I2C_SDA_PIN = 8;
+static const int I2C_SCL_PIN = 9;
 
 static DNSServer dnsServer;
 static AsyncWebServer server(80);
 static Preferences prefs;
+static bool rtcPresent = false;
+
+struct Ds1307Time
+{
+    uint16_t year;
+    uint8_t month;
+    uint8_t day;
+    uint8_t hour;
+    uint8_t minute;
+    uint8_t second;
+};
+
+bool isLeapYear(uint16_t year)
+{
+    return (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+}
+
+uint8_t daysInMonth(uint16_t year, uint8_t month)
+{
+    switch (month)
+    {
+    case 2:
+        return isLeapYear(year) ? 29 : 28;
+    case 4:
+    case 6:
+    case 9:
+    case 11:
+        return 30;
+    default:
+        return 31;
+    }
+}
+
+uint8_t dayOfWeekFromDate(uint16_t year, uint8_t month, uint8_t day)
+{
+    if (month < 3)
+        year--;
+    uint32_t y = year;
+    uint32_t m = month;
+    uint32_t d = day;
+    uint32_t t = (y + y / 4 - y / 100 + y / 400 + (13 * m + 8) / 5 + d) % 7;
+    return (uint8_t)((t + 5) % 7);
+}
+
+uint32_t daysSince2000(uint16_t year, uint8_t month, uint8_t day)
+{
+    uint32_t days = 0;
+    for (uint16_t y = 2000; y < year; y++)
+        days += (isLeapYear(y) ? 366 : 365);
+    for (uint8_t m = 1; m < month; m++)
+        days += daysInMonth(year, m);
+    days += day - 1;
+    return days;
+}
 
 static unsigned long apStartMillis = 0;
 static bool apActive = false;
@@ -81,6 +138,135 @@ void stopAP()
     WiFi.softAPdisconnect(true);
     apActive = false;
     Serial.println("AP stopped");
+}
+
+uint8_t bcdToDec(uint8_t value)
+{
+    return (value >> 4) * 10 + (value & 0x0F);
+}
+
+uint8_t decToBcd(uint8_t value)
+{
+    return ((value / 10) << 4) | (value % 10);
+}
+
+bool ds1307WriteRegister(uint8_t reg, uint8_t value)
+{
+    Wire.beginTransmission(0x68);
+    Wire.write(reg);
+    Wire.write(value);
+    return Wire.endTransmission() == 0;
+}
+
+bool ds1307ReadTime(Ds1307Time &time)
+{
+    uint8_t regs[7] = {0};
+
+    Wire.beginTransmission(0x68);
+    Wire.write(0x00);
+    if (Wire.endTransmission(false) != 0)
+        return false;
+    if (Wire.requestFrom(0x68, 7) != 7)
+        return false;
+
+    for (int i = 0; i < 7; i++)
+        regs[i] = Wire.read();
+
+    time.second = bcdToDec(regs[0] & 0x7F);
+    time.minute = bcdToDec(regs[1] & 0x7F);
+    time.hour = bcdToDec(regs[2] & 0x3F);
+    time.day = bcdToDec(regs[4] & 0x3F);
+    time.month = bcdToDec(regs[5] & 0x1F);
+    time.year = 2000 + bcdToDec(regs[6]);
+    return true;
+}
+
+uint8_t rtcDayOfWeekFromIndex(uint8_t weekdayIndex)
+{
+    if (weekdayIndex == 0)
+        return 1;
+    return weekdayIndex;
+}
+
+bool ds1307WriteTime(const Ds1307Time &time)
+{
+    uint8_t weekdayIndex = dayOfWeekFromDate(time.year, time.month, time.day);
+    uint8_t regs[8] = {
+        decToBcd(time.second) & 0x7F,
+        decToBcd(time.minute) & 0x7F,
+        decToBcd(time.hour) & 0x3F,
+        decToBcd(rtcDayOfWeekFromIndex(weekdayIndex)) & 0x07,
+        decToBcd(time.day) & 0x3F,
+        decToBcd(time.month) & 0x1F,
+        decToBcd((uint8_t)(time.year % 100)),
+        0x00};
+
+    Wire.beginTransmission(0x68);
+    Wire.write(0x00);
+    for (int i = 0; i < 7; i++)
+        Wire.write(regs[i]);
+    return Wire.endTransmission() == 0;
+}
+
+String formatRtcDateTime(const Ds1307Time &now)
+{
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%02u.%02u.%04u %02u:%02u:%02u",
+             now.day, now.month, now.year, now.hour, now.minute, now.second);
+    return String(buf);
+}
+
+String formatRtcDateInput(const Ds1307Time &now)
+{
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%04u-%02u-%02u", now.year, now.month, now.day);
+    return String(buf);
+}
+
+String formatRtcTimeInput(const Ds1307Time &now)
+{
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%02u:%02u", now.hour, now.minute);
+    return String(buf);
+}
+
+bool initRtc()
+{
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+    uint8_t dummy = 0;
+    Wire.beginTransmission(0x68);
+    Wire.write(0x00);
+    rtcPresent = (Wire.endTransmission(false) == 0);
+    if (!rtcPresent)
+    {
+        Serial.println("DS1307 not found on I2C");
+        return false;
+    }
+
+    if (dummy & 0x80)
+    {
+        Serial.println("DS1307 was halted; restarting it");
+        ds1307WriteRegister(0x00, dummy & 0x7F);
+    }
+    Serial.println("DS1307 ready");
+    return true;
+}
+
+bool readRtcTime(uint8_t &hour, uint8_t &minute, uint8_t &weekdayIndex, uint32_t &dayIndex, String &display)
+{
+    if (!rtcPresent)
+        return false;
+
+    Ds1307Time now;
+    if (!ds1307ReadTime(now))
+        return false;
+
+    hour = now.hour;
+    minute = now.minute;
+    weekdayIndex = dayOfWeekFromDate(now.year, now.month, now.day);
+    dayIndex = daysSince2000(now.year, now.month, now.day);
+    display = formatRtcDateTime(now);
+    return true;
 }
 
 // Persistence
@@ -218,15 +404,36 @@ bool scheduleMatchesToday(const Schedule &s, uint8_t weekdayIndex, uint32_t dayI
 void checkSchedules()
 {
     static uint32_t lastMinute = 0;
-    unsigned long m = millis() / 60000UL;
-    if (m == lastMinute)
-        return;
-    lastMinute = m;
-    unsigned long totalMinutes = m % (24UL * 60UL);
-    uint8_t hour = totalMinutes / 60;
-    uint8_t minute = totalMinutes % 60;
-    uint8_t weekday = (m / (24UL * 60UL)) % 7;
-    uint32_t dayIndex = m / (24UL * 60UL);
+    static uint32_t lastDayIndex = 0;
+    uint8_t hour = 0;
+    uint8_t minute = 0;
+    uint8_t weekday = 0;
+    uint32_t dayIndex = 0;
+    String display;
+
+    if (rtcPresent)
+    {
+        if (!readRtcTime(hour, minute, weekday, dayIndex, display))
+            return;
+        uint32_t currentMinute = (uint32_t)hour * 60UL + minute;
+        if (currentMinute == lastMinute && dayIndex == lastDayIndex)
+            return;
+        lastMinute = currentMinute;
+        lastDayIndex = dayIndex;
+    }
+    else
+    {
+        unsigned long m = millis() / 60000UL;
+        if (m == lastMinute)
+            return;
+        lastMinute = m;
+        unsigned long totalMinutes = m % (24UL * 60UL);
+        hour = totalMinutes / 60;
+        minute = totalMinutes % 60;
+        weekday = (m / (24UL * 60UL)) % 7;
+        dayIndex = m / (24UL * 60UL);
+    }
+
     for (int i = 0; i < scheduleCount; i++)
     {
         Schedule &s = schedules[i];
@@ -257,6 +464,13 @@ if(r->method()==HTTP_GET) r->redirect(String("http://") + apIP.toString() + "/")
 void apiStatus(AsyncWebServerRequest *request)
 {
     DynamicJsonDocument doc(256);
+    String rtcDisplay = "";
+    if (rtcPresent)
+    {
+        Ds1307Time now;
+        if (ds1307ReadTime(now))
+            rtcDisplay = formatRtcDateTime(now);
+    }
     doc["uptimeMin"] = millis() / 60000UL;
     doc["batteryV"] = 12.4;
     doc["solarW"] = 124.5;
@@ -264,6 +478,17 @@ void apiStatus(AsyncWebServerRequest *request)
     doc["pump2Active"] = (activeRuns[2].active || activeRuns[3].active);
     doc["apActive"] = apActive;
     doc["ssid"] = makeApName();
+    doc["rtcPresent"] = rtcPresent;
+    doc["rtcDisplay"] = rtcDisplay;
+    if (rtcPresent)
+    {
+        Ds1307Time now;
+        if (ds1307ReadTime(now))
+        {
+            doc["rtcDateInput"] = formatRtcDateInput(now);
+            doc["rtcTimeInput"] = formatRtcTimeInput(now);
+        }
+    }
     String out;
     serializeJson(doc, out);
     request->send(200, "application/json", out);
@@ -396,6 +621,26 @@ void handleDeleteSchedule(AsyncWebServerRequest *request)
     request->send(200, "application/json", "{\"ok\":1}");
 }
 
+void handleSetRtc(AsyncWebServerRequest *request)
+{
+    if (!rtcPresent)
+    {
+        request->send(500, "application/json", "{\"ok\":0,\"error\":\"RTC unavailable\"}");
+        return;
+    }
+
+    Ds1307Time time;
+    time.year = request->hasArg("year") ? request->arg("year").toInt() : 2000;
+    time.month = request->hasArg("month") ? request->arg("month").toInt() : 1;
+    time.day = request->hasArg("day") ? request->arg("day").toInt() : 1;
+    time.hour = request->hasArg("hour") ? request->arg("hour").toInt() : 0;
+    time.minute = request->hasArg("minute") ? request->arg("minute").toInt() : 0;
+    time.second = request->hasArg("second") ? request->arg("second").toInt() : 0;
+
+    bool ok = ds1307WriteTime(time);
+    request->send(ok ? 200 : 500, "application/json", ok ? "{\"ok\":1}" : "{\"ok\":0,\"error\":\"write failed\"}");
+}
+
 void setupServerRoutes()
 {
     server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *r)
@@ -410,6 +655,8 @@ void setupServerRoutes()
               { r->send(200); }, NULL, handleUpdateSchedule);
     server.on("/api/schedules/delete", HTTP_DELETE, [](AsyncWebServerRequest *r)
               { handleDeleteSchedule(r); });
+    server.on("/api/rtc/set", HTTP_POST, [](AsyncWebServerRequest *r)
+              { handleSetRtc(r); });
     initFileServer();
 }
 
@@ -423,6 +670,7 @@ void setup()
         Serial.println("LittleFS mounted");
     prefs.begin("gc", false);
     loadSchedules();
+    initRtc();
     setPumpPins();
     startAP();
     setupServerRoutes();

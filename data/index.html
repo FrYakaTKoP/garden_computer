@@ -1,11 +1,13 @@
 <!doctype html>
 <html>
+
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Tuttli9000 Garden Controller</title>
   <link rel="stylesheet" href="/style.css">
 </head>
+
 <body>
   <div class="app">
     <header>
@@ -13,7 +15,10 @@
         <h1>Tuttli9000</h1>
         <p>Garden controller • AP portal • irrigation automation</p>
       </div>
-      <button id="refresh">Refresh</button>
+      <div class="header-actions">
+        <button id="settings" class="secondary">Settings</button>
+        <button id="refresh">Refresh</button>
+      </div>
     </header>
 
     <section class="cards">
@@ -29,6 +34,10 @@
         <h3>AP Status</h3>
         <div id="apstatus" class="value">--</div>
       </article>
+      <article class="card">
+        <h3>Time / Date</h3>
+        <div id="clock" class="value">--</div>
+      </article>
     </section>
 
     <section class="panel">
@@ -41,8 +50,10 @@
 
     <section class="panel">
       <div id="formwrap" style="display:none"></div>
+      <div id="settingswrap" style="display:none"></div>
     </section>
   </div>
   <script src="/app.js"></script>
 </body>
+
 </html>

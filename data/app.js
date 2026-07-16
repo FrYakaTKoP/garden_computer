@@ -26,7 +26,34 @@
         document.getElementById('battery').textContent = `${Number(data.batteryV || 0).toFixed(1)} V`;
         document.getElementById('solar').textContent = `${Number(data.solarW || 0).toFixed(0)} W`;
         document.getElementById('apstatus').textContent = data.apActive ? `AP active (${data.ssid || 'Tuttli9000'})` : 'AP idle';
+        const clock = document.getElementById('clock');
+        if (data.rtcPresent && data.rtcDisplay) {
+            const parts = data.rtcDisplay.split(' ');
+            const datePart = parts[0] || '';
+            const timePart = parts[1] || '';
+            clock.textContent = `${datePart} ${timePart}`.trim();
+            clock.classList.remove('muted');
+        } else {
+            clock.textContent = 'RTC unavailable';
+            clock.classList.add('muted');
+        }
     }
+
+    function splitRtcString(value) {
+        const parts = (value || '').trim().split(' ');
+        const datePart = parts[0] || '';
+        const timePart = parts[1] || '';
+        const dateMatch = /^([0-9]{2})\.([0-9]{2})\.([0-9]{4})$/.exec(datePart);
+        if (!dateMatch) return null;
+        return {
+            day: parseInt(dateMatch[1], 10),
+            month: parseInt(dateMatch[2], 10),
+            year: parseInt(dateMatch[3], 10),
+            time: timePart
+        };
+    }
+
+    let statusTimer = null;
 
     function reload() {
         api('/api/status').then(renderStatus).catch(() => {
@@ -81,6 +108,85 @@
         });
     }
 
+    function openSettings() {
+        const wrap = document.getElementById('settingswrap');
+        wrap.className = 'modal';
+        wrap.style.display = 'flex';
+        wrap.innerHTML = '';
+        wrap.onclick = (e) => { if (e.target === wrap) wrap.style.display = 'none'; };
+
+        const panel = el('div', { className: 'modal-panel' });
+        const title = el('h3', {}, 'RTC settings');
+        const hint = el('p', { className: 'muted' }, 'Set the DS1307 clock on the controller.');
+        const liveValue = el('p', { className: 'muted' }, 'RTC value: loading…');
+        const form = el('div', { className: 'form' });
+
+        const dateRow = el('div', { className: 'row' });
+        const dayInput = el('input', { type: 'number', min: 1, max: 31, inputMode: 'numeric' });
+        const monthInput = el('input', { type: 'number', min: 1, max: 12, inputMode: 'numeric' });
+        const yearInput = el('input', { type: 'number', min: 2000, max: 2099, inputMode: 'numeric' });
+        const timeInput = el('input', { type: 'time' });
+        dateRow.appendChild(el('label', {}, 'Date (DD.MM.YYYY): '));
+        dateRow.appendChild(dayInput);
+        dateRow.appendChild(el('span', {}, '.'));
+        dateRow.appendChild(monthInput);
+        dateRow.appendChild(el('span', {}, '.'));
+        dateRow.appendChild(yearInput);
+        dateRow.appendChild(el('label', {}, ' Time: '));
+        dateRow.appendChild(timeInput);
+
+        const actions = el('div', { className: 'row' });
+        const save = el('button', {}, 'Save time');
+        save.onclick = () => {
+            const day = parseInt(dayInput.value, 10);
+            const month = parseInt(monthInput.value, 10);
+            const year = parseInt(yearInput.value, 10);
+            const [hour, minute] = timeInput.value.split(':').map(v => parseInt(v, 10));
+            const url = `/api/rtc/set?year=${year}&month=${month}&day=${day}&hour=${hour}&minute=${minute}&second=0`;
+            fetch(url, { method: 'POST' }).then(() => {
+                wrap.style.display = 'none';
+                reload();
+            }).catch(() => {
+                alert('Unable to set RTC time.');
+            });
+        };
+        const cancel = el('button', { className: 'secondary' }, 'Cancel');
+        cancel.onclick = () => { wrap.style.display = 'none'; };
+        actions.appendChild(save);
+        actions.appendChild(cancel);
+
+        api('/api/status').then(data => {
+            liveValue.textContent = `RTC value: ${data.rtcDisplay || 'unavailable'}`;
+            const current = splitRtcString(data.rtcDisplay || '');
+            if (current) {
+                dayInput.value = String(current.day).padStart(2, '0');
+                monthInput.value = String(current.month).padStart(2, '0');
+                yearInput.value = String(current.year);
+                timeInput.value = current.time;
+            } else {
+                const now = new Date();
+                dayInput.value = String(now.getDate()).padStart(2, '0');
+                monthInput.value = String(now.getMonth() + 1).padStart(2, '0');
+                yearInput.value = String(now.getFullYear());
+                timeInput.value = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+            }
+        }).catch(() => {
+            const now = new Date();
+            dayInput.value = String(now.getDate()).padStart(2, '0');
+            monthInput.value = String(now.getMonth() + 1).padStart(2, '0');
+            yearInput.value = String(now.getFullYear());
+            timeInput.value = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+        });
+
+        form.appendChild(dateRow);
+        form.appendChild(actions);
+        panel.appendChild(title);
+        panel.appendChild(hint);
+        panel.appendChild(liveValue);
+        panel.appendChild(form);
+        wrap.appendChild(panel);
+    }
+
     function openForm(s) {
         const wrap = document.getElementById('formwrap');
         wrap.className = 'modal';
@@ -100,7 +206,7 @@
         const minuteInput = el('input', { type: 'number', min: 0, max: 55, step: 5, value: s.minute });
         timeRow.appendChild(el('label', {}, 'Time: '));
         timeRow.appendChild(hourInput);
-        timeRow.appendChild(el('label', {}, ':' ));
+        timeRow.appendChild(el('label', {}, ':'));
         timeRow.appendChild(minuteInput);
 
         const durationRow = el('div', { className: 'row' });
@@ -174,7 +280,16 @@
         wrap.appendChild(panel);
     }
 
+    function startStatusPolling() {
+        if (statusTimer) clearInterval(statusTimer);
+        statusTimer = setInterval(() => {
+            api('/api/status').then(renderStatus).catch(() => {});
+        }, 5000);
+    }
+
     document.getElementById('add').onclick = () => openForm(null);
     document.getElementById('refresh').onclick = () => reload();
+    document.getElementById('settings').onclick = () => openSettings();
     reload();
+    startStatusPolling();
 })();

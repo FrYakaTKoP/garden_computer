@@ -1,6 +1,19 @@
 {
     "idf.currentSetup": "C:\\esp\\v6.0.2\\esp-idf",
     "chat.tools.terminal.autoApprove": {
-        "C:/python/Scripts/pio.exe": true
+        "C:/python/Scripts/pio.exe": true,
+        "pio": true,
+        "/^python -m platformio run$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^node --check data/app\\.js$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "where.exe": true,
+        "Test-Path": true,
+        "Get-Item": true,
+        "C:\\Users\\FrY\\.platformio\\penv\\Scripts\\platformio.exe": true
     }
 }
