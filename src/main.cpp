@@ -38,7 +38,12 @@ static DNSServer dnsServer;
 static AsyncWebServer server(80);
 static Preferences prefs;
 static bool rtcPresent = false;
-static unsigned long lastTracerPollMs = 0;
+
+// MT50 frame listening
+static const size_t RX_BUFFER_SIZE = 256;
+static uint8_t rxBuffer[RX_BUFFER_SIZE];
+static size_t rxIndex = 0;
+static unsigned long lastMt50FrameMs = 0;
 
 struct EpeverTracerData
 {
@@ -284,136 +289,126 @@ uint16_t modbusCrc16(const uint8_t *data, size_t len)
     return crc;
 }
 
-bool modbusReadRegister(uint16_t address, uint16_t &value, uint32_t timeoutMs = 500)
+// Decode MT50 live data frame (Function 0x43)
+bool decodeMt50Frame(const uint8_t *frame, size_t frameLen, EpeverTracerData &data)
 {
-    uint8_t request[8] = {MODBUS_SLAVE_ADDRESS, 0x03,
-                          (uint8_t)((address >> 8) & 0xFF),
-                          (uint8_t)(address & 0xFF),
-                          0x00, 0x01, 0x00, 0x00};
-    uint16_t crc = modbusCrc16(request, 6);
-    request[6] = (uint8_t)(crc & 0xFF);
-    request[7] = (uint8_t)((crc >> 8) & 0xFF);
-
-    while (Serial1.available())
-        Serial1.read();
-
-    digitalWrite(RS485_DE_PIN, HIGH);
-    Serial1.write(request, sizeof(request));
-    Serial1.flush();
-    digitalWrite(RS485_DE_PIN, LOW);
-    delay(20);
-
-    uint8_t response[64] = {0};
-    size_t index = 0;
-    unsigned long start = millis();
-    while (millis() - start < timeoutMs)
-    {
-        while (Serial1.available() && index < sizeof(response))
-        {
-            response[index++] = (uint8_t)Serial1.read();
-            if (index >= 8)
-                break;
-        }
-        if (index >= 8)
-            break;
-        delay(5);
-    }
-
-    // Debug: print received frame
-    Serial.printf("Modbus RX %u bytes:", (unsigned)index);
-    for (size_t i = 0; i < index; i++)
-        Serial.printf(" %02X", response[i]);
-    Serial.println();
-
-    if (index < 5)
-    {
-        Serial.println("Modbus: frame too short");
+    if (frameLen < 67)
         return false;
-    }
 
-    if (response[0] != MODBUS_SLAVE_ADDRESS || response[1] != 0x03)
-    {
-        Serial.printf("Modbus: unexpected addr/fc (addr=%02X fc=%02X)\n", response[0], response[1]);
+    if (frame[0] != MODBUS_SLAVE_ADDRESS || frame[1] != 0x43)
         return false;
-    }
 
-    uint8_t byteCount = response[2];
-    if (byteCount != 2)
+    // Validate CRC (last 2 bytes)
+    uint16_t frameDataLen = frameLen - 2;
+    uint16_t frameCrc = ((uint16_t)frame[frameLen - 1] << 8) | frame[frameLen - 2];
+    uint16_t calcCrc = modbusCrc16(frame, frameDataLen);
+    if (frameCrc != calcCrc)
     {
-        Serial.printf("Modbus: unexpected byte count %u\n", (unsigned)byteCount);
-        return false;
-    }
-
-    uint16_t responseCrc = ((uint16_t)response[index - 1] << 8) | response[index - 2];
-    uint16_t calcCrc = modbusCrc16(response, index - 2);
-    if (responseCrc != calcCrc)
-    {
-        Serial.printf("Modbus: CRC mismatch, respCRC=0x%04X calcCRC=0x%04X\n", responseCrc, calcCrc);
-        // Print raw received message for debugging
-        Serial.print("Modbus: raw:");
-        for (size_t i = 0; i < index; i++)
-            Serial.printf(" %02X", response[i]);
+        Serial.printf("MT50: CRC mismatch, frameCRC=0x%04X calcCRC=0x%04X\n", frameCrc, calcCrc);
+        Serial.print("MT50: raw frame:");
+        for (size_t i = 0; i < frameLen; i++)
+            Serial.printf(" %02X", frame[i]);
         Serial.println();
         return false;
     }
 
-    value = ((uint16_t)response[3] << 8) | response[4];
-    return true;
-}
-
-bool readTracerData(EpeverTracerData &data)
-{
     EpeverTracerData fresh;
-    uint16_t raw = 0;
 
-    if (!modbusReadRegister(REG_PV_VOLTAGE, raw))
-        return false;
-    fresh.pvVoltage = raw / 10.0f;
+    // Extract 16-bit big-endian values from data section (offset 2 is frame[2+offset])
+    // Offsets based on MT50 0x43 response format
+    auto getU16 = [&](size_t offset) -> uint16_t {
+        return ((uint16_t)frame[2 + offset] << 8) | frame[2 + offset + 1];
+    };
 
-    if (!modbusReadRegister(REG_PV_CURRENT, raw))
-        return false;
-    fresh.pvCurrent = raw / 10.0f;
+    // PV Voltage (typically at offset 16-17 in data)
+    fresh.pvVoltage = getU16(16) / 100.0f;
 
-    if (!modbusReadRegister(REG_BATTERY_VOLTAGE, raw))
-        return false;
-    fresh.batteryVoltage = raw / 10.0f;
+    // PV Current (at offset 18-19)
+    fresh.pvCurrent = getU16(18) / 100.0f;
 
-    if (!modbusReadRegister(REG_BATTERY_CURRENT, raw))
-        return false;
-    fresh.batteryCurrent = raw / 10.0f;
+    // PV Power = PV Voltage * PV Current
+    fresh.pvPowerWatts = fresh.pvVoltage * fresh.pvCurrent;
 
-    if (!modbusReadRegister(REG_LOAD_VOLTAGE, raw))
-        return false;
-    fresh.loadVoltage = raw / 10.0f;
+    // Battery Voltage (at offset 24-25) - CORRECTED to match Load Voltage
+    fresh.batteryVoltage = getU16(24) / 100.0f;
 
-    if (!modbusReadRegister(REG_LOAD_CURRENT, raw))
-        return false;
-    fresh.loadCurrent = raw / 10.0f;
+    // Battery Current (at offset 34-35)
+    fresh.batteryCurrent = getU16(34) / 100.0f;
+
+    // Battery Power
+    fresh.batteryPowerWatts = fresh.batteryVoltage * fresh.batteryCurrent;
+
+    // Load Voltage (at offset 32-33)
+    fresh.loadVoltage = getU16(32) / 100.0f;
+
+    // Load Current (at offset 36-37)
+    fresh.loadCurrent = getU16(36) / 100.0f;
+
+    // Load Power
+    fresh.loadPowerWatts = fresh.loadVoltage * fresh.loadCurrent;
 
     fresh.valid = true;
     data = fresh;
+
+    Serial.printf("MT50: PV=%.2fV*%.2fA=%.1fW, BAT=%.2fV*%.2fA=%.2fW, LOAD=%.2fV*%.2fA=%.1fW\n",
+                  fresh.pvVoltage, fresh.pvCurrent, fresh.pvPowerWatts,
+                  fresh.batteryVoltage, fresh.batteryCurrent, fresh.batteryPowerWatts,
+                  fresh.loadVoltage, fresh.loadCurrent, fresh.loadPowerWatts);
+
     return true;
+}
+
+// Process incoming MT50 frames from Serial1 buffer
+void processMt50Stream()
+{
+    while (Serial1.available())
+    {
+        uint8_t byte = (uint8_t)Serial1.read();
+        rxBuffer[rxIndex++] = byte;
+
+        if (rxIndex >= RX_BUFFER_SIZE)
+            rxIndex = 0;
+
+        // Check if we have a complete frame (0x43 function, min 67 bytes with CRC)
+        if (rxIndex >= 67 && rxBuffer[(rxIndex - 67 + RX_BUFFER_SIZE) % RX_BUFFER_SIZE] == MODBUS_SLAVE_ADDRESS)
+        {
+            // Try to find frame start
+            for (size_t i = 0; i < rxIndex; i++)
+            {
+                size_t startIdx = (rxIndex - i + RX_BUFFER_SIZE) % RX_BUFFER_SIZE;
+                if (rxBuffer[startIdx] == MODBUS_SLAVE_ADDRESS && 
+                    rxBuffer[(startIdx + 1) % RX_BUFFER_SIZE] == 0x43)
+                {
+                    // Extract potential frame (67+ bytes)
+                    uint8_t tempFrame[128];
+                    size_t frameLen = 0;
+                    for (size_t j = 0; j < 128 && frameLen < 128; j++)
+                    {
+                        tempFrame[frameLen++] = rxBuffer[(startIdx + j) % RX_BUFFER_SIZE];
+                    }
+
+                    // Try to decode
+                    if (decodeMt50Frame(tempFrame, frameLen, tracerData))
+                    {
+                        lastMt50FrameMs = millis();
+                        rxIndex = 0; // Reset buffer after successful frame
+                        return;
+                    }
+                    break;
+                }
+            }
+        }
+    }
 }
 
 void refreshTracerDataIfNeeded()
 {
-    unsigned long now = millis();
-    if (now - lastTracerPollMs < 3000UL)
-        return;
+    // Passive listener - just process incoming frames
+    processMt50Stream();
 
-    lastTracerPollMs = now;
-    static uint32_t tracerFailureCount = 0;
-
-    if (!readTracerData(tracerData))
-    {
+    // Mark data as invalid if no frame received for 10 seconds
+    if (millis() - lastMt50FrameMs > 10000UL)
         tracerData.valid = false;
-        if (++tracerFailureCount % 10 == 0)
-            Serial.println("Tracer poll failed");
-    }
-    else
-    {
-        tracerFailureCount = 0;
-    }
 }
 
 bool initRtc()
@@ -874,7 +869,7 @@ void setup()
     pinMode(RS485_DE_PIN, OUTPUT);
     digitalWrite(RS485_DE_PIN, LOW);
     Serial1.begin(MODBUS_BAUD_RATE, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
-    Serial.printf("RS485 UART1 ready on pins TX=%d RX=%d DE=%d\n", RS485_TX_PIN, RS485_RX_PIN, RS485_DE_PIN);
+    Serial.printf("RS485 UART1 ready on pins TX=%d RX=%d DE=%d (passive MT50 listener)\n", RS485_TX_PIN, RS485_RX_PIN, RS485_DE_PIN);
     setPumpPins();
     startAP();
     setupServerRoutes();
