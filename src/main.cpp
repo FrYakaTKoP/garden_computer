@@ -18,8 +18,8 @@ static const IPAddress apIP(192, 168, 4, 1);
 static const uint8_t DNS_PORT = 53;
 static const uint32_t AP_TIMEOUT_MS = 15UL * 60UL * 1000UL;
 static const int RESTART_BUTTON_PIN = 0;
-static const int PUMP1_PIN = 16;
-static const int PUMP2_PIN = 17;
+static const int PUMP1_PIN = 37;
+static const int PUMP2_PIN = 38; // must not overlap the RS485 UART pins
 static const int I2C_SDA_PIN = 8;
 static const int I2C_SCL_PIN = 9;
 static const int RS485_DE_PIN = 15;
@@ -319,20 +319,43 @@ bool modbusReadRegister(uint16_t address, uint16_t &value, uint32_t timeoutMs = 
         delay(5);
     }
 
-    if (index < 8)
+    // Debug: print received frame
+    Serial.printf("Modbus RX %u bytes:", (unsigned)index);
+    for (size_t i = 0; i < index; i++)
+        Serial.printf(" %02X", response[i]);
+    Serial.println();
+
+    if (index < 5)
+    {
+        Serial.println("Modbus: frame too short");
         return false;
+    }
 
     if (response[0] != MODBUS_SLAVE_ADDRESS || response[1] != 0x03)
+    {
+        Serial.printf("Modbus: unexpected addr/fc (addr=%02X fc=%02X)\n", response[0], response[1]);
         return false;
+    }
 
     uint8_t byteCount = response[2];
     if (byteCount != 2)
+    {
+        Serial.printf("Modbus: unexpected byte count %u\n", (unsigned)byteCount);
         return false;
+    }
 
     uint16_t responseCrc = ((uint16_t)response[index - 1] << 8) | response[index - 2];
     uint16_t calcCrc = modbusCrc16(response, index - 2);
     if (responseCrc != calcCrc)
+    {
+        Serial.printf("Modbus: CRC mismatch, respCRC=0x%04X calcCRC=0x%04X\n", responseCrc, calcCrc);
+        // Print raw received message for debugging
+        Serial.print("Modbus: raw:");
+        for (size_t i = 0; i < index; i++)
+            Serial.printf(" %02X", response[i]);
+        Serial.println();
         return false;
+    }
 
     value = ((uint16_t)response[3] << 8) | response[4];
     return true;
@@ -836,6 +859,11 @@ void setup()
 {
     Serial.begin(115200);
     delay(200);
+    if (PUMP1_PIN == RS485_TX_PIN || PUMP1_PIN == RS485_RX_PIN || PUMP1_PIN == RS485_DE_PIN ||
+        PUMP2_PIN == RS485_TX_PIN || PUMP2_PIN == RS485_RX_PIN || PUMP2_PIN == RS485_DE_PIN)
+    {
+        Serial.println("Pin conflict detected between pump outputs and RS485 pins");
+    }
     if (!LittleFS.begin(true))
         Serial.println("LittleFS mount failed");
     else
