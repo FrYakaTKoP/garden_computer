@@ -40,9 +40,6 @@ static Preferences prefs;
 static bool rtcPresent = false;
 
 // MT50 frame listening
-static const size_t RX_BUFFER_SIZE = 256;
-static uint8_t rxBuffer[RX_BUFFER_SIZE];
-static size_t rxIndex = 0;
 static unsigned long lastMt50FrameMs = 0;
 
 struct EpeverTracerData
@@ -292,59 +289,54 @@ uint16_t modbusCrc16(const uint8_t *data, size_t len)
 // Decode MT50 live data frame (Function 0x43)
 bool decodeMt50Frame(const uint8_t *frame, size_t frameLen, EpeverTracerData &data)
 {
+    // MT50 0x43 frames are exactly 67 bytes: slave(1) + func(1) + data(63) + crc(2)
     if (frameLen < 67)
         return false;
 
     if (frame[0] != MODBUS_SLAVE_ADDRESS || frame[1] != 0x43)
         return false;
 
-    // Validate CRC (last 2 bytes)
-    uint16_t frameDataLen = frameLen - 2;
+    // Validate CRC (last 2 bytes, little-endian)
     uint16_t frameCrc = ((uint16_t)frame[frameLen - 1] << 8) | frame[frameLen - 2];
-    uint16_t calcCrc = modbusCrc16(frame, frameDataLen);
+    uint16_t calcCrc = modbusCrc16(frame, frameLen - 2);
     if (frameCrc != calcCrc)
     {
-        Serial.printf("MT50: CRC mismatch, frameCRC=0x%04X calcCRC=0x%04X\n", frameCrc, calcCrc);
-        Serial.print("MT50: raw frame:");
-        for (size_t i = 0; i < frameLen; i++)
-            Serial.printf(" %02X", frame[i]);
-        Serial.println();
+        Serial.printf("MT50: CRC mismatch at frame, frameCRC=0x%04X calcCRC=0x%04X\n", frameCrc, calcCrc);
         return false;
     }
 
     EpeverTracerData fresh;
 
-    // Extract 16-bit big-endian values from data section (offset 2 is frame[2+offset])
-    // Offsets based on MT50 0x43 response format
-    auto getU16 = [&](size_t offset) -> uint16_t {
-        return ((uint16_t)frame[2 + offset] << 8) | frame[2 + offset + 1];
+    // Extract 16-bit big-endian values from frame
+    // Based on working sniffer: offsets are byte positions in the frame
+    auto getU16BE = [&](size_t byteOffset) -> uint16_t {
+        return ((uint16_t)frame[byteOffset] << 8) | frame[byteOffset + 1];
     };
 
-    // PV Voltage (typically at offset 16-17 in data)
-    fresh.pvVoltage = getU16(16) / 100.0f;
+    // Offsets based on the working example (where bytes are numbered from 0)
+    // PV Voltage at byte 18-19
+    fresh.pvVoltage = getU16BE(18) / 100.0f;
 
-    // PV Current (at offset 18-19)
-    fresh.pvCurrent = getU16(18) / 100.0f;
+    // PV Current at byte 20-21
+    fresh.pvCurrent = getU16BE(20) / 100.0f;
 
-    // PV Power = PV Voltage * PV Current
+    // PV Power
     fresh.pvPowerWatts = fresh.pvVoltage * fresh.pvCurrent;
 
-    // Battery Voltage (at offset 24-25) - CORRECTED to match Load Voltage
-    fresh.batteryVoltage = getU16(24) / 100.0f;
+    // Battery Voltage at byte 26-27
+    fresh.batteryVoltage = getU16BE(26) / 100.0f;
 
-    // Battery Current (at offset 34-35)
-    fresh.batteryCurrent = getU16(34) / 100.0f;
+    // Load Voltage at byte 34-35
+    fresh.loadVoltage = getU16BE(34) / 100.0f;
 
-    // Battery Power
+    // Load Current at byte 36-37
+    fresh.loadCurrent = getU16BE(36) / 100.0f;
+
+    // Battery Current = PV Current - Load Current (charge controller logic)
+    fresh.batteryCurrent = fresh.pvCurrent - fresh.loadCurrent;
+
+    // Power calculations
     fresh.batteryPowerWatts = fresh.batteryVoltage * fresh.batteryCurrent;
-
-    // Load Voltage (at offset 32-33)
-    fresh.loadVoltage = getU16(32) / 100.0f;
-
-    // Load Current (at offset 36-37)
-    fresh.loadCurrent = getU16(36) / 100.0f;
-
-    // Load Power
     fresh.loadPowerWatts = fresh.loadVoltage * fresh.loadCurrent;
 
     fresh.valid = true;
@@ -355,44 +347,50 @@ bool decodeMt50Frame(const uint8_t *frame, size_t frameLen, EpeverTracerData &da
                   fresh.batteryVoltage, fresh.batteryCurrent, fresh.batteryPowerWatts,
                   fresh.loadVoltage, fresh.loadCurrent, fresh.loadPowerWatts);
 
-    return true;
-}
+    return true;}
 
 // Process incoming MT50 frames from Serial1 buffer
 void processMt50Stream()
 {
+    static uint8_t frameBuf[128];
+    static size_t frameIdx = 0;
+    static unsigned long lastByteTime = 0;
+
     while (Serial1.available())
     {
         uint8_t byte = (uint8_t)Serial1.read();
-        rxBuffer[rxIndex++] = byte;
+        lastByteTime = millis();
 
-        if (rxIndex >= RX_BUFFER_SIZE)
-            rxIndex = 0;
+        frameBuf[frameIdx++] = byte;
+        if (frameIdx >= sizeof(frameBuf))
+            frameIdx = 0;  // Overflow protection
 
-        // Check if we have a complete frame (0x43 function, min 67 bytes with CRC)
-        if (rxIndex >= 67 && rxBuffer[(rxIndex - 67 + RX_BUFFER_SIZE) % RX_BUFFER_SIZE] == MODBUS_SLAVE_ADDRESS)
+        // Look for frame sync pattern: 01 43
+        if (frameIdx >= 2)
         {
-            // Try to find frame start
-            for (size_t i = 0; i < rxIndex; i++)
+            for (size_t i = 0; i + 1 < frameIdx; i++)
             {
-                size_t startIdx = (rxIndex - i + RX_BUFFER_SIZE) % RX_BUFFER_SIZE;
-                if (rxBuffer[startIdx] == MODBUS_SLAVE_ADDRESS && 
-                    rxBuffer[(startIdx + 1) % RX_BUFFER_SIZE] == 0x43)
+                if (frameBuf[i] == MODBUS_SLAVE_ADDRESS && frameBuf[i + 1] == 0x43)
                 {
-                    // Extract potential frame (67+ bytes)
-                    uint8_t tempFrame[128];
-                    size_t frameLen = 0;
-                    for (size_t j = 0; j < 128 && frameLen < 128; j++)
-                    {
-                        tempFrame[frameLen++] = rxBuffer[(startIdx + j) % RX_BUFFER_SIZE];
-                    }
+                    // Found potential frame start
+                    size_t frameStart = i;
+                    size_t availableBytes = frameIdx - frameStart;
 
-                    // Try to decode
-                    if (decodeMt50Frame(tempFrame, frameLen, tracerData))
+                    if (availableBytes >= 67)
                     {
-                        lastMt50FrameMs = millis();
-                        rxIndex = 0; // Reset buffer after successful frame
-                        return;
+                        // Try to decode this frame
+                        if (decodeMt50Frame(&frameBuf[frameStart], 67, tracerData))
+                        {
+                            lastMt50FrameMs = millis();
+                            // Remove decoded frame from buffer
+                            if (frameStart + 67 < frameIdx)
+                                memmove(frameBuf, &frameBuf[frameStart + 67], frameIdx - frameStart - 67);
+                            frameIdx = frameIdx - frameStart - 67;
+                            return;
+                        }
+                        // If CRC failed, try next position
+                        if (frameStart + 1 < frameIdx)
+                            i++;  // Skip this sync and look for next
                     }
                     break;
                 }
