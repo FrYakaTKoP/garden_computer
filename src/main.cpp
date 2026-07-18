@@ -265,17 +265,19 @@ String formatRtcTimeInput(const Ds1307Time &now)
     return String(buf);
 }
 
-uint16_t modbusCrc16(const uint8_t *data, size_t len)
+uint16_t crc16(const uint8_t *buf, uint16_t len)
 {
     uint16_t crc = 0xFFFF;
-    for (size_t i = 0; i < len; ++i)
+    for (uint16_t pos = 0; pos < len; pos++)
     {
-        crc ^= (uint16_t)data[i];
-        for (int bit = 0; bit < 8; ++bit)
+        crc ^= buf[pos];
+
+        for (uint8_t i = 0; i < 8; i++)
         {
-            if ((crc & 0x0001) != 0)
+            if (crc & 1)
             {
-                crc = (uint16_t)((crc >> 1) ^ 0xA001);
+                crc >>= 1;
+                crc ^= 0xA001;
             }
             else
             {
@@ -284,6 +286,18 @@ uint16_t modbusCrc16(const uint8_t *data, size_t len)
         }
     }
     return crc;
+}
+
+void dumpRawFrame(const uint8_t *frame, size_t frameLen, const char *prefix)
+{
+    Serial.printf("%s len=%u: ", prefix, (unsigned)frameLen);
+    for (size_t i = 0; i < frameLen; i++)
+    {
+        Serial.printf("%02X", frame[i]);
+        if (i + 1 < frameLen)
+            Serial.print(' ');
+    }
+    Serial.println();
 }
 
 // Decode MT50 live data frame (Function 0x43)
@@ -298,10 +312,11 @@ bool decodeMt50Frame(const uint8_t *frame, size_t frameLen, EpeverTracerData &da
 
     // Validate CRC (last 2 bytes, little-endian)
     uint16_t frameCrc = ((uint16_t)frame[frameLen - 1] << 8) | frame[frameLen - 2];
-    uint16_t calcCrc = modbusCrc16(frame, frameLen - 2);
+    uint16_t calcCrc = crc16(frame, (uint16_t)(frameLen - 2));
     if (frameCrc != calcCrc)
     {
         Serial.printf("MT50: CRC mismatch at frame, frameCRC=0x%04X calcCRC=0x%04X\n", frameCrc, calcCrc);
+        dumpRawFrame(frame, frameLen, "MT50 raw frame");
         return false;
     }
 
@@ -381,6 +396,7 @@ void processMt50Stream()
                         // Try to decode this frame
                         if (decodeMt50Frame(&frameBuf[frameStart], 67, tracerData))
                         {
+                            dumpRawFrame(&frameBuf[frameStart], 67, "MT50 raw frame (valid)");
                             lastMt50FrameMs = millis();
                             // Remove decoded frame from buffer
                             if (frameStart + 67 < frameIdx)
@@ -388,9 +404,18 @@ void processMt50Stream()
                             frameIdx = frameIdx - frameStart - 67;
                             return;
                         }
-                        // If CRC failed, try next position
-                        if (frameStart + 1 < frameIdx)
-                            i++;  // Skip this sync and look for next
+                        // If CRC failed, discard one byte and keep searching for the next sync.
+                        size_t dropCount = frameStart + 1;
+                        if (dropCount < frameIdx)
+                        {
+                            memmove(frameBuf, &frameBuf[dropCount], frameIdx - dropCount);
+                            frameIdx -= dropCount;
+                        }
+                        else
+                        {
+                            frameIdx = 0;
+                        }
+                        return;
                     }
                     break;
                 }
