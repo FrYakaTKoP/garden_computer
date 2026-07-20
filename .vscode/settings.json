@@ -20,6 +20,30 @@
         "/^& \"C:\\\\Users\\\\FrY\\\\\\.platformio\\\\penv\\\\Scripts\\\\platformio\\.exe\" run -e esp32-s3-devkitc-1 -t buildprog$/": {
             "approve": true,
             "matchCommandLine": true
+        },
+        "/^& \"C:\\\\Users\\\\FrY\\\\\\.platformio\\\\penv\\\\Scripts\\\\platformio\\.exe\" run -e esp32-s3-devkitc-1$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^& \"C:\\\\Users\\\\FrY\\\\\\.platformio\\\\penv\\\\Scripts\\\\platformio\\.exe\" run -e esp32-s3-devkitc-1 -q$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^& \"C:\\\\Users\\\\FrY\\\\\\.platformio\\\\penv\\\\Scripts\\\\platformio\\.exe\" run --target build_upload_all --environment esp32-s3-devkitc-1$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^Start-Process -FilePath 'C:\\\\Users\\\\FrY\\\\\\.platformio\\\\penv\\\\Scripts\\\\platformio\\.exe' -ArgumentList @\\('run','--target','build_upload_all','--environment','esp32-s3-devkitc-1'\\) -NoNewWindow -Wait$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cmd /c \"\\\\\"C:\\\\Users\\\\FrY\\\\\\.platformio\\\\penv\\\\Scripts\\\\platformio\\.exe\\\\\" run --target build_upload_all --environment esp32-s3-devkitc-1\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^powershell -NoProfile -Command \"& 'C:\\\\Users\\\\FrY\\\\\\.platformio\\\\penv\\\\Scripts\\\\platformio\\.exe' run --target build_upload_all --environment esp32-s3-devkitc-1\"$/": {
+            "approve": true,
+            "matchCommandLine": true
         }
     }
 }

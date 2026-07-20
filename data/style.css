@@ -71,6 +71,37 @@ header p {
   font-size: 1.35rem;
   font-weight: 700;
   margin-top: 6px;
+  white-space: pre-line;
+  line-height: 1.25;
+}
+
+.powerflow {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.flow-col {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 8px;
+  min-width: 0;
+}
+
+.flow-title {
+  font-size: 0.85rem;
+  color: var(--muted);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  margin-bottom: 6px;
+}
+
+.flow-line {
+  font-size: 1.05rem;
+  font-weight: 700;
+  line-height: 1.35;
 }
 
 .panel-head {
@@ -204,6 +235,14 @@ select {
     padding: 10px;
   }
 
+  .cards {
+    grid-template-columns: 1fr;
+  }
+
+  .powerflow-card {
+    grid-column: 1 / -1;
+  }
+
   header {
     flex-direction: column;
     align-items: flex-start;
@@ -212,6 +251,25 @@ select {
   .panel-head {
     flex-direction: column;
     align-items: flex-start;
+  }
+
+  .powerflow {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+  }
+
+  .flow-col {
+    padding: 8px 6px;
+  }
+
+  .flow-title {
+    font-size: 0.75rem;
+    margin-bottom: 4px;
+  }
+
+  .flow-line {
+    font-size: 0.88rem;
+    line-height: 1.2;
   }
 
   .day-grid {

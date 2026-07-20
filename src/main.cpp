@@ -27,7 +27,7 @@
 using namespace fs;
 
 // Configuration
-static const char *AP_PREFIX = "Tuttli9000-";
+static const char *AP_NAME = "tuttli-9000";
 static const char *AP_PASSWORD = ""; // open AP
 static const IPAddress apIP(192, 168, 4, 1);
 static const uint8_t DNS_PORT = 53;
@@ -47,15 +47,19 @@ static const uint8_t MODBUS_SLAVE_ADDRESS = 0x01;
 static const uint32_t MODBUS_BAUD_RATE = 115200;
 static const uint32_t MODBUS_POLL_INTERVAL_MS = 2000UL;
 static const uint32_t MODBUS_RESPONSE_TIMEOUT_MS = 250UL;
+static const bool MODBUS_DEBUG_SERIAL = true;
 static const uint16_t REG_PV_VOLTAGE = 0x3100;
 static const uint16_t REG_PV_CURRENT = 0x3101;
 static const uint16_t REG_BATTERY_VOLTAGE = 0x3104;
 static const uint16_t REG_BATTERY_CURRENT = 0x3105;
 static const uint16_t REG_LOAD_VOLTAGE = 0x310C;
 static const uint16_t REG_LOAD_CURRENT = 0x310D;
+static const uint16_t REG_BATTERY_TEMPERATURE = 0x3110;
 static const uint16_t REG_BATTERY_SOC = 0x311A;
 static const uint16_t REG_DAILY_GENERATED_ENERGY = 0x330C;
 static const uint16_t REG_MONTHLY_GENERATED_ENERGY = 0x330E;
+static const uint16_t REG_TOTAL_GENERATED_ENERGY = 0x3312;
+static const uint16_t REG_BATTERY_NET_CURRENT = 0x331B;
 
 static DNSServer dnsServer;
 static AsyncWebServer server(80);
@@ -66,6 +70,7 @@ static bool rtcDebug = RTC_DEBUG_DEFAULT != 0;
 static bool rtcBusStarted = false;
 static unsigned long lastRtcProbeMs = 0;
 static SemaphoreHandle_t rtcI2cMutex = nullptr;
+static SemaphoreHandle_t modbusMutex = nullptr;
 static U8G2_ST7920_128X64_F_SW_SPI lcd(U8G2_R0, LCD_SCK_PIN, LCD_MOSI_PIN, LCD_CS_PIN, U8X8_PIN_NONE);
 
 // Epever Modbus polling
@@ -80,6 +85,7 @@ struct EpeverTracerData
     float pvCurrent = 0.0f;
     float batteryVoltage = 0.0f;
     float batteryCurrent = 0.0f;
+    float batteryTemperatureC = 0.0f;
     float loadVoltage = 0.0f;
     float loadCurrent = 0.0f;
     float pvPowerWatts = 0.0f;
@@ -101,6 +107,7 @@ static uint8_t flowAnimState = 0;
 
 static float pvDailyWh = 0.0f;
 static float pvMonthlyWh = 0.0f;
+static float pvTotalWh = 0.0f;
 static unsigned long lastEnergySampleMs = 0;
 static bool haveEnergySample = false;
 static uint16_t energyYear = 0;
@@ -120,11 +127,18 @@ struct Ds1307Time
 };
 
 bool initRtc();
+bool modbusWriteMultipleRegisters(uint16_t startRegister, uint16_t registerCount, const uint16_t *registers);
 
 void ensureRtcMutex()
 {
     if (rtcI2cMutex == nullptr)
         rtcI2cMutex = xSemaphoreCreateMutex();
+}
+
+void ensureModbusMutex()
+{
+    if (modbusMutex == nullptr)
+        modbusMutex = xSemaphoreCreateMutex();
 }
 
 bool lockRtcI2C(TickType_t timeoutTicks = pdMS_TO_TICKS(100))
@@ -236,11 +250,7 @@ static ActiveRun activeRuns[4];
 // Utilities
 String makeApName()
 {
-    uint8_t mac[6];
-    WiFi.softAPmacAddress(mac);
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%s%02X%02X", AP_PREFIX, mac[4], mac[5]);
-    return String(buf);
+    return String(AP_NAME);
 }
 void startAP()
 {
@@ -307,9 +317,9 @@ bool ds1307ReadTime(Ds1307Time &time)
 
     Wire.beginTransmission(0x68);
     Wire.write(0x00);
-    if (Wire.endTransmission(true) != 0)
+    if (Wire.endTransmission((uint8_t)1) != 0)
         return false;
-    if (Wire.requestFrom(0x68, 7, true) != 7)
+    if (Wire.requestFrom((uint8_t)0x68, (size_t)7) != 7)
         return false;
 
     for (int i = 0; i < 7; i++)
@@ -391,15 +401,15 @@ uint8_t rtcDayOfWeekFromIndex(uint8_t weekdayIndex)
 bool ds1307WriteTime(const Ds1307Time &time)
 {
     uint8_t weekdayIndex = dayOfWeekFromDate(time.year, time.month, time.day);
-    uint8_t regs[8] = {
-        decToBcd(time.second) & 0x7F,
-        decToBcd(time.minute) & 0x7F,
-        decToBcd(time.hour) & 0x3F,
-        decToBcd(rtcDayOfWeekFromIndex(weekdayIndex)) & 0x07,
-        decToBcd(time.day) & 0x3F,
-        decToBcd(time.month) & 0x1F,
-        decToBcd((uint8_t)(time.year % 100)),
-        0x00};
+    uint8_t regs[8];
+    regs[0] = (uint8_t)(decToBcd(time.second) & 0x7F);
+    regs[1] = (uint8_t)(decToBcd(time.minute) & 0x7F);
+    regs[2] = (uint8_t)(decToBcd(time.hour) & 0x3F);
+    regs[3] = (uint8_t)(decToBcd(rtcDayOfWeekFromIndex(weekdayIndex)) & 0x07);
+    regs[4] = (uint8_t)(decToBcd(time.day) & 0x3F);
+    regs[5] = (uint8_t)(decToBcd(time.month) & 0x1F);
+    regs[6] = (uint8_t)(decToBcd((uint8_t)(time.year % 100)));
+    regs[7] = 0x00;
 
     Wire.beginTransmission(0x68);
     Wire.write(0x00);
@@ -408,11 +418,25 @@ bool ds1307WriteTime(const Ds1307Time &time)
     return Wire.endTransmission() == 0;
 }
 
+    bool syncRtcTimeToEpeverController()
+    {
+        Ds1307Time now;
+        if (!readRtcDateTime(now))
+            return false;
+
+        uint16_t rtcRegisters[3] = {
+            (uint16_t)(now.second | ((uint16_t)now.minute << 8)),
+            (uint16_t)(now.hour | ((uint16_t)now.day << 8)),
+            (uint16_t)(now.month | ((uint16_t)(now.year - 2000) << 8))};
+
+        return modbusWriteMultipleRegisters(0x9013, 3, rtcRegisters);
+    }
+
 String formatRtcDateTime(const Ds1307Time &now)
 {
     char buf[32];
-    snprintf(buf, sizeof(buf), "%02u.%02u.%04u %02u:%02u:%02u",
-             now.day, now.month, now.year, now.hour, now.minute, now.second);
+    snprintf(buf, sizeof(buf), "%02u.%02u.%04u %02u:%02u",
+             now.day, now.month, now.year, now.hour, now.minute);
     return String(buf);
 }
 
@@ -434,7 +458,7 @@ String formatRtcBottomLine(const Ds1307Time &now)
 {
     char buf[24];
     snprintf(buf, sizeof(buf), "%02u.%02u.%04u %02u:%02u",
-             now.day, now.month, now.year, now.hour, now.second);
+             now.day, now.month, now.year, now.hour, now.minute);
     return String(buf);
 }
 
@@ -457,7 +481,13 @@ void drawBatteryIcon(int16_t x, int16_t baselineY, uint8_t soc)
     int16_t y = baselineY - 12;
     lcd.drawFrame(x, y + 2, 14, 8);
     lcd.drawBox(x + 14, y + 4, 2, 4);
-    uint8_t fill = (uint8_t)((soc > 100 ? 100 : soc) / 10);
+    uint8_t clampedSoc = soc > 100 ? 100 : soc;
+    // Interior is 12 px wide; ensure >90% renders visually full.
+    uint8_t fill = (uint8_t)((clampedSoc * 12) / 100);
+    if (clampedSoc > 90)
+        fill = 12;
+    if (fill > 12)
+        fill = 12;
     if (fill > 0)
         lcd.drawBox(x + 1, y + 3, fill, 6);
 }
@@ -482,36 +512,77 @@ void drawFlowChevrons(int16_t x, int16_t y, bool enabled)
         lcd.drawStr(x + 12, y, ">");
 }
 
+uint8_t batterySocForIcon(uint16_t soc)
+{
+    if (soc < 5)
+        return 3;
+    if (soc <= 30)
+        return 20;
+    if (soc <= 90)
+        return 65;
+    return 100;
+}
+
 void drawPowerFlowScreen()
 {
     lcd.setFont(u8g2_font_5x7_tf);
 
     char line[28];
     lcd.drawStr(2, 8, "PV");
-    lcd.drawStr(47, 8, "BAT");
+    drawBatteryIcon(47, 10, batterySocForIcon(epeverData.valid ? epeverData.batterySoc : 0));
     lcd.drawStr(92, 8, "LOAD");
 
-    snprintf(line, sizeof(line), "%.1fV", epeverData.valid ? epeverData.pvVoltage : 0.0f);
+    if (epeverData.valid)
+        snprintf(line, sizeof(line), "%.2fV", epeverData.pvVoltage);
+    else
+        snprintf(line, sizeof(line), "xx.xxV");
     lcd.drawStr(2, 18, line);
-    snprintf(line, sizeof(line), "%.1fA", epeverData.valid ? epeverData.pvCurrent : 0.0f);
+    if (epeverData.valid)
+        snprintf(line, sizeof(line), "%.2fA", epeverData.pvCurrent);
+    else
+        snprintf(line, sizeof(line), "xx.xxA");
     lcd.drawStr(2, 28, line);
-    snprintf(line, sizeof(line), "%.0fW", epeverData.valid ? epeverData.pvPowerWatts : 0.0f);
+    if (epeverData.valid)
+        snprintf(line, sizeof(line), "%.2fW", epeverData.pvPowerWatts);
+    else
+        snprintf(line, sizeof(line), "xx.xxW");
     lcd.drawStr(2, 38, line);
 
-    snprintf(line, sizeof(line), "%.1fV", epeverData.valid ? epeverData.batteryVoltage : 0.0f);
+    if (epeverData.valid)
+        snprintf(line, sizeof(line), "%.2fV", epeverData.batteryVoltage);
+    else
+        snprintf(line, sizeof(line), "xx.xxV");
     lcd.drawStr(47, 18, line);
-    snprintf(line, sizeof(line), "%.1fA", epeverData.valid ? epeverData.batteryCurrent : 0.0f);
+    if (epeverData.valid)
+        snprintf(line, sizeof(line), "%.2fA", epeverData.batteryCurrent);
+    else
+        snprintf(line, sizeof(line), "xx.xxA");
     lcd.drawStr(47, 28, line);
-    snprintf(line, sizeof(line), "%.0fW", epeverData.valid ? epeverData.batteryPowerWatts : 0.0f);
+    if (epeverData.valid)
+        snprintf(line, sizeof(line), "%.2fW", epeverData.batteryPowerWatts);
+    else
+        snprintf(line, sizeof(line), "xx.xxW");
     lcd.drawStr(47, 38, line);
-    snprintf(line, sizeof(line), "SOC %u%%", epeverData.batterySoc);
+    if (epeverData.valid)
+        snprintf(line, sizeof(line), "%.2fC", epeverData.batteryTemperatureC);
+    else
+        snprintf(line, sizeof(line), "xx.xxC");
     lcd.drawStr(47, 48, line);
 
-    snprintf(line, sizeof(line), "%.1fV", epeverData.valid ? epeverData.loadVoltage : 0.0f);
+    if (epeverData.valid)
+        snprintf(line, sizeof(line), "%.2fV", epeverData.loadVoltage);
+    else
+        snprintf(line, sizeof(line), "xx.xxV");
     lcd.drawStr(92, 18, line);
-    snprintf(line, sizeof(line), "%.1fA", epeverData.valid ? epeverData.loadCurrent : 0.0f);
+    if (epeverData.valid)
+        snprintf(line, sizeof(line), "%.2fA", epeverData.loadCurrent);
+    else
+        snprintf(line, sizeof(line), "xx.xxA");
     lcd.drawStr(92, 28, line);
-    snprintf(line, sizeof(line), "%.0fW", epeverData.valid ? epeverData.loadPowerWatts : 0.0f);
+    if (epeverData.valid)
+        snprintf(line, sizeof(line), "%.2fW", epeverData.loadPowerWatts);
+    else
+        snprintf(line, sizeof(line), "xx.xxW");
     lcd.drawStr(92, 38, line);
 
     Ds1307Time now;
@@ -523,17 +594,19 @@ void drawEnergyWifiScreen()
 {
     char line[40];
     lcd.setFont(u8g2_font_5x7_tf);
-    snprintf(line, sizeof(line), "Daily:   %.2f kWh", pvDailyWh / 1000.0f);
+    snprintf(line, sizeof(line), "Day:     %.2f kWh", pvDailyWh / 1000.0f);
     lcd.drawStr(2, 12, line);
-    snprintf(line, sizeof(line), "Monthly: %.2f kWh", pvMonthlyWh / 1000.0f);
+    snprintf(line, sizeof(line), "Month:   %.2f kWh", pvMonthlyWh / 1000.0f);
     lcd.drawStr(2, 24, line);
+    snprintf(line, sizeof(line), "Total:   %.2f kWh", pvTotalWh / 1000.0f);
+    lcd.drawStr(2, 36, line);
 
-    lcd.setFont(u8g2_font_4x6_tf);
+    lcd.setFont(u8g2_font_5x7_tf);
     if (apActive)
-        snprintf(line, sizeof(line), "WiFi AP: ON %s", makeApName().c_str());
+        snprintf(line, sizeof(line), "WiFi AP: ON");
     else
         snprintf(line, sizeof(line), "WiFi AP: OFF");
-    lcd.drawStr(2, 38, line);
+    lcd.drawStr(2, 48, line);
 }
 
 void updateEnergyCounters()
@@ -613,7 +686,7 @@ void updateDisplay()
 {
     unsigned long nowMs = millis();
 
-    if (nowMs - lastScreenSwitchMs >= 20000UL)
+    if (nowMs - lastScreenSwitchMs >= 10000UL)
     {
         activeDisplayScreen = (activeDisplayScreen + 1) % 2;
         lastScreenSwitchMs = nowMs;
@@ -660,8 +733,26 @@ uint16_t crc16(const uint8_t *buf, uint16_t len)
     return crc;
 }
 
+void serialPrintHexBuffer(const uint8_t *buffer, size_t len)
+{
+    for (size_t i = 0; i < len; i++)
+    {
+        Serial.printf("%02X", buffer[i]);
+        if (i + 1 < len)
+            Serial.print(' ');
+    }
+}
+
 bool modbusReadInputRegisters(uint16_t startRegister, uint16_t registerCount, uint16_t *registers)
 {
+    ensureModbusMutex();
+    if (modbusMutex == nullptr || xSemaphoreTake(modbusMutex, pdMS_TO_TICKS(500)) != pdTRUE)
+    {
+        if (MODBUS_DEBUG_SERIAL)
+            Serial.println("Modbus mutex timeout (read)");
+        return false;
+    }
+
     uint8_t request[8] = {
         MODBUS_SLAVE_ADDRESS,
         0x04,
@@ -676,6 +767,13 @@ bool modbusReadInputRegisters(uint16_t startRegister, uint16_t registerCount, ui
     request[6] = (uint8_t)(requestCrc & 0xFF);
     request[7] = (uint8_t)(requestCrc >> 8);
 
+    if (MODBUS_DEBUG_SERIAL)
+    {
+        Serial.printf("Modbus TX addr=0x%02X func=0x04 reg=0x%04X count=%u frame=", MODBUS_SLAVE_ADDRESS, startRegister, registerCount);
+        serialPrintHexBuffer(request, sizeof(request));
+        Serial.println();
+    }
+
     while (Serial1.available())
         Serial1.read();
 
@@ -686,7 +784,8 @@ bool modbusReadInputRegisters(uint16_t startRegister, uint16_t registerCount, ui
     delayMicroseconds(200);
     digitalWrite(RS485_DE_PIN, LOW);
 
-    const size_t expectedBytes = 5 + (size_t)registerCount * 2;
+    size_t expectedBytes = 5 + (size_t)registerCount * 2;
+    bool gotExceptionFrame = false;
     uint8_t response[64] = {0};
     size_t received = 0;
     unsigned long startMs = millis();
@@ -694,20 +793,227 @@ bool modbusReadInputRegisters(uint16_t startRegister, uint16_t registerCount, ui
     {
         while (Serial1.available() && received < expectedBytes)
             response[received++] = (uint8_t)Serial1.read();
+
+        // Modbus exception responses are always 5 bytes: addr, func|0x80, code, crcLo, crcHi.
+        if (!gotExceptionFrame && received >= 2 && response[1] == (uint8_t)(0x80 | 0x04))
+        {
+            gotExceptionFrame = true;
+            expectedBytes = 5;
+        }
     }
 
     if (received != expectedBytes)
+    {
+        if (MODBUS_DEBUG_SERIAL)
+        {
+            Serial.printf("Modbus timeout reg=0x%04X expected=%u received=%u timeoutMs=%lu",
+                          startRegister,
+                          (unsigned)expectedBytes,
+                          (unsigned)received,
+                          (unsigned long)MODBUS_RESPONSE_TIMEOUT_MS);
+            if (received > 0)
+            {
+                Serial.print(" rx=");
+                serialPrintHexBuffer(response, received);
+            }
+            Serial.println();
+        }
+        xSemaphoreGive(modbusMutex);
         return false;
+    }
+    if (gotExceptionFrame)
+    {
+        if (received != 5)
+        {
+            if (MODBUS_DEBUG_SERIAL)
+            {
+                Serial.printf("Modbus exception frame incomplete reg=0x%04X received=%u rx=",
+                              startRegister,
+                              (unsigned)received);
+                serialPrintHexBuffer(response, received);
+                Serial.println();
+            }
+            xSemaphoreGive(modbusMutex);
+            return false;
+        }
+
+        uint16_t responseCrc = ((uint16_t)response[4] << 8) | response[3];
+        uint16_t calcCrc = crc16(response, 3);
+        if (responseCrc != calcCrc)
+        {
+            if (MODBUS_DEBUG_SERIAL)
+            {
+                Serial.printf("Modbus exception CRC mismatch reg=0x%04X got=0x%04X calc=0x%04X rx=",
+                              startRegister,
+                              responseCrc,
+                              calcCrc);
+                serialPrintHexBuffer(response, received);
+                Serial.println();
+            }
+            xSemaphoreGive(modbusMutex);
+            return false;
+        }
+
+        if (MODBUS_DEBUG_SERIAL)
+        {
+            const uint8_t exceptionCode = response[2];
+            const char *reason = "unknown";
+            if (exceptionCode == 0x01)
+                reason = "illegal function";
+            else if (exceptionCode == 0x02)
+                reason = "illegal data address";
+            else if (exceptionCode == 0x03)
+                reason = "illegal data value";
+            else if (exceptionCode == 0x04)
+                reason = "slave device failure";
+
+            Serial.printf("Modbus exception reg=0x%04X code=0x%02X (%s)\n",
+                          startRegister,
+                          exceptionCode,
+                          reason);
+        }
+        xSemaphoreGive(modbusMutex);
+        return false;
+    }
+
     if (response[0] != MODBUS_SLAVE_ADDRESS || response[1] != 0x04 || response[2] != registerCount * 2)
+    {
+        if (MODBUS_DEBUG_SERIAL)
+        {
+            Serial.printf("Modbus header mismatch reg=0x%04X got=[%02X %02X %02X] expected=[%02X 04 %02X] rx=",
+                          startRegister,
+                          response[0], response[1], response[2],
+                          MODBUS_SLAVE_ADDRESS,
+                          (uint8_t)(registerCount * 2));
+            serialPrintHexBuffer(response, expectedBytes);
+            Serial.println();
+        }
+        xSemaphoreGive(modbusMutex);
         return false;
+    }
 
     uint16_t responseCrc = ((uint16_t)response[expectedBytes - 1] << 8) | response[expectedBytes - 2];
     uint16_t calcCrc = crc16(response, (uint16_t)(expectedBytes - 2));
     if (responseCrc != calcCrc)
+    {
+        if (MODBUS_DEBUG_SERIAL)
+        {
+            Serial.printf("Modbus CRC mismatch reg=0x%04X got=0x%04X calc=0x%04X rx=",
+                          startRegister,
+                          responseCrc,
+                          calcCrc);
+            serialPrintHexBuffer(response, expectedBytes);
+            Serial.println();
+        }
         return false;
+    }
 
     for (uint16_t i = 0; i < registerCount; i++)
         registers[i] = ((uint16_t)response[3 + i * 2] << 8) | response[4 + i * 2];
+
+    if (MODBUS_DEBUG_SERIAL)
+    {
+        Serial.printf("Modbus RX ok reg=0x%04X count=%u firstReg=0x%04X\n",
+                      startRegister,
+                      registerCount,
+                      registerCount > 0 ? registers[0] : 0);
+    }
+
+    xSemaphoreGive(modbusMutex);
+    return true;
+}
+
+bool modbusWriteMultipleRegisters(uint16_t startRegister, uint16_t registerCount, const uint16_t *registers)
+{
+    ensureModbusMutex();
+    if (modbusMutex == nullptr || xSemaphoreTake(modbusMutex, pdMS_TO_TICKS(500)) != pdTRUE)
+    {
+        if (MODBUS_DEBUG_SERIAL)
+            Serial.println("Modbus mutex timeout (write)");
+        return false;
+    }
+
+    if (registerCount == 0 || registerCount > 16)
+    {
+        xSemaphoreGive(modbusMutex);
+        return false;
+    }
+
+    uint8_t request[64] = {0};
+    request[0] = MODBUS_SLAVE_ADDRESS;
+    request[1] = 0x10;
+    request[2] = (uint8_t)(startRegister >> 8);
+    request[3] = (uint8_t)(startRegister & 0xFF);
+    request[4] = (uint8_t)(registerCount >> 8);
+    request[5] = (uint8_t)(registerCount & 0xFF);
+    request[6] = (uint8_t)(registerCount * 2);
+    for (uint16_t i = 0; i < registerCount; i++)
+    {
+        request[7 + i * 2] = (uint8_t)(registers[i] >> 8);
+        request[8 + i * 2] = (uint8_t)(registers[i] & 0xFF);
+    }
+
+    uint16_t requestCrc = crc16(request, (uint16_t)(7 + registerCount * 2));
+    request[7 + registerCount * 2] = (uint8_t)(requestCrc & 0xFF);
+    request[8 + registerCount * 2] = (uint8_t)(requestCrc >> 8);
+
+    if (MODBUS_DEBUG_SERIAL)
+    {
+        Serial.printf("Modbus TX addr=0x%02X func=0x10 reg=0x%04X count=%u frame=", MODBUS_SLAVE_ADDRESS, startRegister, registerCount);
+        serialPrintHexBuffer(request, (size_t)(9 + registerCount * 2));
+        Serial.println();
+    }
+
+    while (Serial1.available())
+        Serial1.read();
+
+    digitalWrite(RS485_DE_PIN, HIGH);
+    delayMicroseconds(200);
+    Serial1.write(request, (size_t)(9 + registerCount * 2));
+    Serial1.flush();
+    delayMicroseconds(200);
+    digitalWrite(RS485_DE_PIN, LOW);
+
+    uint8_t response[8] = {0};
+    size_t received = 0;
+    unsigned long startMs = millis();
+    while (received < sizeof(response) && millis() - startMs < MODBUS_RESPONSE_TIMEOUT_MS)
+    {
+        while (Serial1.available() && received < sizeof(response))
+            response[received++] = (uint8_t)Serial1.read();
+    }
+
+    if (received != sizeof(response))
+    {
+        if (MODBUS_DEBUG_SERIAL)
+        {
+            Serial.printf("Modbus write timeout reg=0x%04X received=%u timeoutMs=%lu\n",
+                          startRegister,
+                          (unsigned)received,
+                          (unsigned long)MODBUS_RESPONSE_TIMEOUT_MS);
+        }
+        xSemaphoreGive(modbusMutex);
+        return false;
+    }
+
+    uint16_t responseCrc = ((uint16_t)response[7] << 8) | response[6];
+    uint16_t calcCrc = crc16(response, 6);
+    if (response[0] != MODBUS_SLAVE_ADDRESS || response[1] != 0x10 || response[2] != request[2] || response[3] != request[3] || response[4] != request[4] || response[5] != request[5] || responseCrc != calcCrc)
+    {
+        if (MODBUS_DEBUG_SERIAL)
+        {
+            Serial.printf("Modbus write mismatch reg=0x%04X rx=[%02X %02X %02X %02X %02X %02X %02X %02X]\n",
+                          startRegister,
+                          response[0], response[1], response[2], response[3], response[4], response[5], response[6], response[7]);
+        }
+        xSemaphoreGive(modbusMutex);
+        return false;
+    }
+
+    if (MODBUS_DEBUG_SERIAL)
+        Serial.printf("Modbus write ok reg=0x%04X count=%u\n", startRegister, registerCount);
+
+    xSemaphoreGive(modbusMutex);
     return true;
 }
 
@@ -718,23 +1024,66 @@ uint32_t modbusU32LowHigh(const uint16_t *registers, uint16_t startIndex)
 
 bool pollEpeverData(EpeverTracerData &data)
 {
-    uint16_t liveRegisters[27] = {0};
+    uint16_t powerRegisters[14] = {0};
+    uint16_t temperatureRegister[1] = {0};
+    uint16_t socRegister[1] = {0};
     uint16_t energyRegisters[4] = {0};
+    uint16_t totalEnergyRegisters[2] = {0};
+    uint16_t netBatteryCurrentRegister[1] = {0};
 
-    if (!modbusReadInputRegisters(REG_PV_VOLTAGE, 27, liveRegisters))
+    if (!modbusReadInputRegisters(REG_PV_VOLTAGE, 14, powerRegisters))
+    {
+        if (MODBUS_DEBUG_SERIAL)
+            Serial.println("Epever poll failed: power register block read failed");
         return false;
+    }
+
+    if (!modbusReadInputRegisters(REG_BATTERY_SOC, 1, socRegister))
+    {
+        if (MODBUS_DEBUG_SERIAL)
+            Serial.println("Epever poll failed: SOC register read failed");
+        return false;
+    }
+
+    if (!modbusReadInputRegisters(REG_BATTERY_TEMPERATURE, 1, temperatureRegister))
+    {
+        if (MODBUS_DEBUG_SERIAL)
+            Serial.println("Epever poll failed: battery temperature register read failed");
+        return false;
+    }
 
     EpeverTracerData fresh;
-    fresh.pvVoltage = liveRegisters[REG_PV_VOLTAGE - REG_PV_VOLTAGE] / 100.0f;
-    fresh.pvCurrent = liveRegisters[REG_PV_CURRENT - REG_PV_VOLTAGE] / 100.0f;
-    fresh.batteryVoltage = liveRegisters[REG_BATTERY_VOLTAGE - REG_PV_VOLTAGE] / 100.0f;
-    fresh.batteryCurrent = liveRegisters[REG_BATTERY_CURRENT - REG_PV_VOLTAGE] / 100.0f;
-    fresh.loadVoltage = liveRegisters[REG_LOAD_VOLTAGE - REG_PV_VOLTAGE] / 100.0f;
-    fresh.loadCurrent = liveRegisters[REG_LOAD_CURRENT - REG_PV_VOLTAGE] / 100.0f;
-    fresh.batterySoc = liveRegisters[REG_BATTERY_SOC - REG_PV_VOLTAGE];
+    fresh.pvVoltage = powerRegisters[REG_PV_VOLTAGE - REG_PV_VOLTAGE] / 100.0f;
+    fresh.pvCurrent = powerRegisters[REG_PV_CURRENT - REG_PV_VOLTAGE] / 100.0f;
+    fresh.batteryVoltage = powerRegisters[REG_BATTERY_VOLTAGE - REG_PV_VOLTAGE] / 100.0f;
+    fresh.batteryTemperatureC = (int16_t)temperatureRegister[0] / 100.0f;
+    fresh.loadVoltage = powerRegisters[REG_LOAD_VOLTAGE - REG_PV_VOLTAGE] / 100.0f;
+    fresh.loadCurrent = powerRegisters[REG_LOAD_CURRENT - REG_PV_VOLTAGE] / 100.0f;
+    fresh.batterySoc = socRegister[0];
     fresh.pvPowerWatts = fresh.pvVoltage * fresh.pvCurrent;
-    fresh.batteryPowerWatts = fresh.batteryVoltage * fresh.batteryCurrent;
     fresh.loadPowerWatts = fresh.loadVoltage * fresh.loadCurrent;
+
+    // Prefer signed net battery current (charge/discharge) when available.
+    if (modbusReadInputRegisters(REG_BATTERY_NET_CURRENT, 1, netBatteryCurrentRegister))
+    {
+        fresh.batteryCurrent = (int16_t)netBatteryCurrentRegister[0] / 100.0f;
+        fresh.batteryPowerWatts = fresh.batteryVoltage * fresh.batteryCurrent;
+        if (MODBUS_DEBUG_SERIAL)
+            Serial.printf("Epever battery net current ok: %.2fA %.2fW\n", fresh.batteryCurrent, fresh.batteryPowerWatts);
+    }
+    else
+    {
+        // Fallback: derive net battery power/current from PV minus load power.
+        const float netPower = fresh.pvPowerWatts - fresh.loadPowerWatts;
+        fresh.batteryPowerWatts = netPower;
+        if (fresh.batteryVoltage > 0.01f)
+            fresh.batteryCurrent = netPower / fresh.batteryVoltage;
+        else
+            fresh.batteryCurrent = 0.0f;
+
+        if (MODBUS_DEBUG_SERIAL)
+            Serial.printf("Epever battery net current fallback: %.2fA %.2fW (pv-load)\n", fresh.batteryCurrent, fresh.batteryPowerWatts);
+    }
     fresh.valid = true;
 
     if (fresh.batterySoc > 100)
@@ -745,6 +1094,25 @@ bool pollEpeverData(EpeverTracerData &data)
         epeverEnergyFromController = true;
         pvDailyWh = modbusU32LowHigh(energyRegisters, 0) * 10.0f;
         pvMonthlyWh = modbusU32LowHigh(energyRegisters, 2) * 10.0f;
+        if (MODBUS_DEBUG_SERIAL)
+        {
+            Serial.printf("Epever energy regs ok: daily=%.1fWh monthly=%.1fWh\n", pvDailyWh, pvMonthlyWh);
+        }
+    }
+    else if (MODBUS_DEBUG_SERIAL)
+    {
+        Serial.println("Epever energy read failed, keeping calculated fallback counters");
+    }
+
+    if (modbusReadInputRegisters(REG_TOTAL_GENERATED_ENERGY, 2, totalEnergyRegisters))
+    {
+        pvTotalWh = modbusU32LowHigh(totalEnergyRegisters, 0) * 10.0f;
+        if (MODBUS_DEBUG_SERIAL)
+            Serial.printf("Epever total energy ok: total=%.1fWh\n", pvTotalWh);
+    }
+    else if (MODBUS_DEBUG_SERIAL)
+    {
+        Serial.println("Epever total energy read failed");
     }
 
     data = fresh;
@@ -768,13 +1136,16 @@ void refreshEpeverDataIfNeeded()
     {
         epeverData = fresh;
         lastEpeverDataMs = nowMs;
-        Serial.printf("Epever: PV=%.2fV %.2fA %.1fW, BAT=%.2fV %.2fA %.2fW, LOAD=%.2fV %.2fA %.1fW, SOC=%u%%\n",
+        Serial.printf("Epever: PV=%.2fV %.2fA %.1fW, BAT=%.2fV %.2fA %.2fW %.1fC, LOAD=%.2fV %.2fA %.1fW, SOC=%u%%\n",
                       fresh.pvVoltage, fresh.pvCurrent, fresh.pvPowerWatts,
-                      fresh.batteryVoltage, fresh.batteryCurrent, fresh.batteryPowerWatts,
+                  fresh.batteryVoltage, fresh.batteryCurrent, fresh.batteryPowerWatts, fresh.batteryTemperatureC,
                       fresh.loadVoltage, fresh.loadCurrent, fresh.loadPowerWatts,
                       fresh.batterySoc);
         return;
     }
+
+    if (MODBUS_DEBUG_SERIAL)
+        Serial.printf("Epever poll attempt failed at uptime=%lus\n", nowMs / 1000UL);
 
     if (nowMs - lastEpeverDataMs > 10000UL)
         epeverData.valid = false;
@@ -802,7 +1173,7 @@ bool initRtc()
 
     Wire.beginTransmission(0x68);
     Wire.write(0x00);
-    rtcPresent = (Wire.endTransmission(true) == 0);
+    rtcPresent = (Wire.endTransmission((uint8_t)1) == 0);
     if (!rtcPresent)
     {
         if (rtcDebug)
@@ -1072,8 +1443,13 @@ void apiStatus(AsyncWebServerRequest *request)
     doc["pvCurrent"] = epeverData.valid ? epeverData.pvCurrent : 0.0f;
     doc["batteryVoltage"] = epeverData.valid ? epeverData.batteryVoltage : 0.0f;
     doc["batteryCurrent"] = epeverData.valid ? epeverData.batteryCurrent : 0.0f;
+    doc["batterySoc"] = epeverData.valid ? epeverData.batterySoc : 0;
+    doc["batteryTempC"] = epeverData.valid ? epeverData.batteryTemperatureC : 0.0f;
     doc["loadVoltage"] = epeverData.valid ? epeverData.loadVoltage : 0.0f;
     doc["loadCurrent"] = epeverData.valid ? epeverData.loadCurrent : 0.0f;
+    doc["pvDailyWh"] = pvDailyWh;
+    doc["pvMonthlyWh"] = pvMonthlyWh;
+    doc["pvTotalWh"] = pvTotalWh;
     doc["tracerValid"] = epeverData.valid;
     doc["pump1Active"] = (activeRuns[0].active || activeRuns[1].active);
     doc["pump2Active"] = (activeRuns[2].active || activeRuns[3].active);
@@ -1265,6 +1641,18 @@ void handleSetRtc(AsyncWebServerRequest *request)
     request->send(ok ? 200 : 500, "application/json", ok ? "{\"ok\":1}" : "{\"ok\":0,\"error\":\"write failed\"}");
 }
 
+void handleSyncRtcToEpever(AsyncWebServerRequest *request)
+{
+    if (!rtcEnabled || !rtcPresent)
+    {
+        request->send(500, "application/json", "{\"ok\":0,\"error\":\"RTC unavailable\"}");
+        return;
+    }
+
+    bool ok = syncRtcTimeToEpeverController();
+    request->send(ok ? 200 : 500, "application/json", ok ? "{\"ok\":1}" : "{\"ok\":0,\"error\":\"sync failed\"}");
+}
+
 void handleRtcConfig(AsyncWebServerRequest *request)
 {
     if (request->hasArg("enabled"))
@@ -1320,6 +1708,8 @@ void setupServerRoutes()
               { handleDeleteSchedule(r); });
     server.on("/api/rtc/set", HTTP_POST, [](AsyncWebServerRequest *r)
               { handleSetRtc(r); });
+    server.on("/api/epever/sync-time", HTTP_POST, [](AsyncWebServerRequest *r)
+              { handleSyncRtcToEpever(r); });
     server.on("/api/rtc/config", HTTP_GET, [](AsyncWebServerRequest *r)
               { handleRtcConfig(r); });
     server.on("/api/rtc/config", HTTP_POST, [](AsyncWebServerRequest *r)
@@ -1357,6 +1747,12 @@ void setup()
     Serial1.begin(MODBUS_BAUD_RATE, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
     Serial1.setTimeout(MODBUS_RESPONSE_TIMEOUT_MS);
     Serial.printf("RS485 UART1 ready on pins TX=%d RX=%d DE=%d (active Epever Modbus polling)\n", RS485_TX_PIN, RS485_RX_PIN, RS485_DE_PIN);
+    Serial.printf("Modbus config: slave=0x%02X baud=%lu poll=%lums timeout=%lums debug=%s\n",
+                  MODBUS_SLAVE_ADDRESS,
+                  (unsigned long)MODBUS_BAUD_RATE,
+                  (unsigned long)MODBUS_POLL_INTERVAL_MS,
+                  (unsigned long)MODBUS_RESPONSE_TIMEOUT_MS,
+                  MODBUS_DEBUG_SERIAL ? "on" : "off");
     setPumpPins();
     Serial.printf("LCD: ST7920 software SPI SCK=%d MOSI=%d CS=%d\n", LCD_SCK_PIN, LCD_MOSI_PIN, LCD_CS_PIN);
     lcd.begin();

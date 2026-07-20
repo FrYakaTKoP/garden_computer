@@ -22,21 +22,33 @@
     </header>
 
     <section class="cards">
-      <article class="card">
-        <h3>Battery</h3>
-        <div id="battery" class="value">-- V / -- A</div>
+      <article class="card powerflow-card">
+        <h3>Power Flow</h3>
+        <div id="powerflow" class="powerflow">
+          <div class="flow-col">
+            <div class="flow-title">PV</div>
+            <div id="pvVoltage" class="flow-line">--.--V</div>
+            <div id="pvCurrent" class="flow-line">--.--A</div>
+            <div id="pvPower" class="flow-line">--.--W</div>
+          </div>
+          <div class="flow-col">
+            <div id="batteryState" class="flow-title">EMPTY</div>
+            <div id="batteryVoltage" class="flow-line">--.--V</div>
+            <div id="batteryCurrent" class="flow-line">--.--A</div>
+            <div id="batteryPower" class="flow-line">--.--W</div>
+            <div id="batteryTemp" class="flow-line">--.--C</div>
+          </div>
+          <div class="flow-col">
+            <div class="flow-title">LOAD</div>
+            <div id="loadVoltage" class="flow-line">--.--V</div>
+            <div id="loadCurrent" class="flow-line">--.--A</div>
+            <div id="loadPower" class="flow-line">--.--W</div>
+          </div>
+        </div>
       </article>
       <article class="card">
-        <h3>Solar</h3>
-        <div id="solar" class="value">-- V / -- A</div>
-      </article>
-      <article class="card">
-        <h3>Load</h3>
-        <div id="load" class="value">-- V / -- A</div>
-      </article>
-      <article class="card">
-        <h3>Tracer Status</h3>
-        <div id="tracerstatus" class="value">--</div>
+        <h3>PV Production</h3>
+        <div id="production" class="value">--</div>
       </article>
       <article class="card">
         <h3>Time / Date</h3>

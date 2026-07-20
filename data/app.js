@@ -22,12 +22,61 @@
         return out.join(', ') || 'None';
     }
 
+    function batteryState(soc) {
+        if (soc < 5) return { label: 'EMPTY', symbol: '[____]' };
+        if (soc <= 30) return { label: 'ALMOST EMPTY', symbol: '[|___]' };
+        if (soc <= 90) return { label: 'OK', symbol: '[|||_]' };
+        return { label: '', symbol: '[||||]' };
+    }
+
+    function setFlowValue(id, value) {
+        document.getElementById(id).textContent = value;
+    }
+
+    function displayNumber(value, unit) {
+        return `${value.toFixed(2)}${unit}`;
+    }
+
     function renderStatus(data) {
-        document.getElementById('battery').textContent = `${Number(data.batteryVoltage || data.batteryV || 0).toFixed(1)} V / ${Number(data.batteryCurrent || 0).toFixed(1)} A`;
-        document.getElementById('solar').textContent = `${Number(data.pvVoltage || 0).toFixed(1)} V / ${Number(data.pvCurrent || 0).toFixed(1)} A`;
-        document.getElementById('load').textContent = `${Number(data.loadVoltage || 0).toFixed(1)} V / ${Number(data.loadCurrent || 0).toFixed(1)} A`;
-        const tracerStatus = data.tracerValid ? 'Connected' : 'Disconnected';
-        document.getElementById('tracerstatus').textContent = tracerStatus;
+        const isValid = !!data.tracerValid;
+        if (isValid) {
+            const batteryVNum = Number(data.batteryVoltage || data.batteryV || 0);
+            const batteryANum = Number(data.batteryCurrent || 0);
+            const batteryV = displayNumber(batteryVNum, 'V');
+            const batteryA = displayNumber(batteryANum, 'A');
+            const batteryW = displayNumber(batteryVNum * batteryANum, 'W');
+            const batteryT = displayNumber(Number(data.batteryTempC || 0), 'C');
+            setFlowValue('batteryState', 'Battery');
+            setFlowValue('pvVoltage', displayNumber(Number(data.pvVoltage || 0), 'V'));
+            setFlowValue('pvCurrent', displayNumber(Number(data.pvCurrent || 0), 'A'));
+            setFlowValue('pvPower', displayNumber(Number(data.pvVoltage || 0) * Number(data.pvCurrent || 0), 'W'));
+            setFlowValue('batteryVoltage', batteryV);
+            setFlowValue('batteryCurrent', batteryA);
+            setFlowValue('batteryPower', batteryW);
+            setFlowValue('batteryTemp', batteryT);
+            setFlowValue('loadVoltage', displayNumber(Number(data.loadVoltage || 0), 'V'));
+            setFlowValue('loadCurrent', displayNumber(Number(data.loadCurrent || 0), 'A'));
+            setFlowValue('loadPower', displayNumber(Number(data.loadVoltage || 0) * Number(data.loadCurrent || 0), 'W'));
+
+            const pvDay = `${(Number(data.pvDailyWh || 0) / 1000).toFixed(2)} kWh`;
+            const pvMonth = `${(Number(data.pvMonthlyWh || 0) / 1000).toFixed(2)} kWh`;
+            const pvTotal = `${(Number(data.pvTotalWh || 0) / 1000).toFixed(2)} kWh`;
+            document.getElementById('production').textContent = `Day:   ${pvDay}\nMonth: ${pvMonth}\nTotal:  ${pvTotal}`;
+        } else {
+            setFlowValue('batteryState', 'Battery');
+            setFlowValue('pvVoltage', 'xx.xxV');
+            setFlowValue('pvCurrent', 'xx.xxA');
+            setFlowValue('pvPower', 'xx.xxW');
+            setFlowValue('batteryVoltage', 'xx.xxV');
+            setFlowValue('batteryCurrent', 'xx.xxA');
+            setFlowValue('batteryPower', 'xx.xxW');
+            setFlowValue('batteryTemp', 'xx.xxC');
+            setFlowValue('loadVoltage', 'xx.xxV');
+            setFlowValue('loadCurrent', 'xx.xxA');
+            setFlowValue('loadPower', 'xx.xxW');
+            document.getElementById('production').textContent = 'Day:   xx.xx kWh\nMonth: xx.xx kWh\nTotal:  xx.xx kWh';
+        }
+
         const clock = document.getElementById('clock');
         if (data.rtcPresent && data.rtcDisplay) {
             const parts = data.rtcDisplay.split(' ');
@@ -59,10 +108,18 @@
 
     function reload() {
         api('/api/status').then(renderStatus).catch(() => {
-            document.getElementById('battery').textContent = '-- V / -- A';
-            document.getElementById('solar').textContent = '-- V / -- A';
-            document.getElementById('load').textContent = '-- V / -- A';
-            document.getElementById('tracerstatus').textContent = 'Unknown';
+            setFlowValue('batteryState', 'EMPTY');
+            setFlowValue('pvVoltage', 'xx.xxV');
+            setFlowValue('pvCurrent', 'xx.xxA');
+            setFlowValue('pvPower', 'xx.xxW');
+            setFlowValue('batteryVoltage', 'xx.xxV');
+            setFlowValue('batteryCurrent', 'xx.xxA');
+            setFlowValue('batteryPower', 'xx.xxW');
+            setFlowValue('batteryTemp', 'xx.xxC');
+            setFlowValue('loadVoltage', 'xx.xxV');
+            setFlowValue('loadCurrent', 'xx.xxA');
+            setFlowValue('loadPower', 'xx.xxW');
+            document.getElementById('production').textContent = 'Day:   xx.xx kWh\nMonth: xx.xx kWh\nTotal:  xx.xx kWh';
         });
 
         api('/api/schedules').then(data => {
@@ -153,9 +210,20 @@
                 alert('Unable to set RTC time.');
             });
         };
+        const sync = el('button', { className: 'secondary' }, 'Sync time to Epever');
+        sync.onclick = () => {
+            fetch('/api/epever/sync-time', { method: 'POST' }).then(async (res) => {
+                if (!res.ok) throw new Error('sync failed');
+                wrap.style.display = 'none';
+                reload();
+            }).catch(() => {
+                alert('Unable to sync RTC time to Epever.');
+            });
+        };
         const cancel = el('button', { className: 'secondary' }, 'Cancel');
         cancel.onclick = () => { wrap.style.display = 'none'; };
         actions.appendChild(save);
+        actions.appendChild(sync);
         actions.appendChild(cancel);
 
         api('/api/status').then(data => {
