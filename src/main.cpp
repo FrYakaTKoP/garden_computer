@@ -45,12 +45,17 @@ static const int LCD_MOSI_PIN = 11; // R/W on Reprap 12864 (ST7920)
 static const int LCD_SCK_PIN = 12;  // E on Reprap 12864 (ST7920)
 static const uint8_t MODBUS_SLAVE_ADDRESS = 0x01;
 static const uint32_t MODBUS_BAUD_RATE = 115200;
+static const uint32_t MODBUS_POLL_INTERVAL_MS = 2000UL;
+static const uint32_t MODBUS_RESPONSE_TIMEOUT_MS = 250UL;
 static const uint16_t REG_PV_VOLTAGE = 0x3100;
 static const uint16_t REG_PV_CURRENT = 0x3101;
 static const uint16_t REG_BATTERY_VOLTAGE = 0x3104;
 static const uint16_t REG_BATTERY_CURRENT = 0x3105;
 static const uint16_t REG_LOAD_VOLTAGE = 0x310C;
 static const uint16_t REG_LOAD_CURRENT = 0x310D;
+static const uint16_t REG_BATTERY_SOC = 0x311A;
+static const uint16_t REG_DAILY_GENERATED_ENERGY = 0x330C;
+static const uint16_t REG_MONTHLY_GENERATED_ENERGY = 0x330E;
 
 static DNSServer dnsServer;
 static AsyncWebServer server(80);
@@ -63,8 +68,10 @@ static unsigned long lastRtcProbeMs = 0;
 static SemaphoreHandle_t rtcI2cMutex = nullptr;
 static U8G2_ST7920_128X64_F_SW_SPI lcd(U8G2_R0, LCD_SCK_PIN, LCD_MOSI_PIN, LCD_CS_PIN, U8X8_PIN_NONE);
 
-// MT50 frame listening
-static unsigned long lastMt50FrameMs = 0;
+// Epever Modbus polling
+static unsigned long lastEpeverPollMs = 0;
+static unsigned long lastEpeverDataMs = 0;
+static bool epeverEnergyFromController = false;
 
 struct EpeverTracerData
 {
@@ -84,7 +91,7 @@ struct EpeverTracerData
     uint16_t errorCode = 0;
 };
 
-static EpeverTracerData tracerData;
+static EpeverTracerData epeverData;
 
 static uint8_t activeDisplayScreen = 0;
 static unsigned long lastScreenSwitchMs = 0;
@@ -484,27 +491,27 @@ void drawPowerFlowScreen()
     lcd.drawStr(47, 8, "BAT");
     lcd.drawStr(92, 8, "LOAD");
 
-    snprintf(line, sizeof(line), "%.1fV", tracerData.valid ? tracerData.pvVoltage : 0.0f);
+    snprintf(line, sizeof(line), "%.1fV", epeverData.valid ? epeverData.pvVoltage : 0.0f);
     lcd.drawStr(2, 18, line);
-    snprintf(line, sizeof(line), "%.1fA", tracerData.valid ? tracerData.pvCurrent : 0.0f);
+    snprintf(line, sizeof(line), "%.1fA", epeverData.valid ? epeverData.pvCurrent : 0.0f);
     lcd.drawStr(2, 28, line);
-    snprintf(line, sizeof(line), "%.0fW", tracerData.valid ? tracerData.pvPowerWatts : 0.0f);
+    snprintf(line, sizeof(line), "%.0fW", epeverData.valid ? epeverData.pvPowerWatts : 0.0f);
     lcd.drawStr(2, 38, line);
 
-    snprintf(line, sizeof(line), "%.1fV", tracerData.valid ? tracerData.batteryVoltage : 0.0f);
+    snprintf(line, sizeof(line), "%.1fV", epeverData.valid ? epeverData.batteryVoltage : 0.0f);
     lcd.drawStr(47, 18, line);
-    snprintf(line, sizeof(line), "%.1fA", tracerData.valid ? tracerData.batteryCurrent : 0.0f);
+    snprintf(line, sizeof(line), "%.1fA", epeverData.valid ? epeverData.batteryCurrent : 0.0f);
     lcd.drawStr(47, 28, line);
-    snprintf(line, sizeof(line), "%.0fW", tracerData.valid ? tracerData.batteryPowerWatts : 0.0f);
+    snprintf(line, sizeof(line), "%.0fW", epeverData.valid ? epeverData.batteryPowerWatts : 0.0f);
     lcd.drawStr(47, 38, line);
-    snprintf(line, sizeof(line), "SOC %u%%", tracerData.batterySoc);
+    snprintf(line, sizeof(line), "SOC %u%%", epeverData.batterySoc);
     lcd.drawStr(47, 48, line);
 
-    snprintf(line, sizeof(line), "%.1fV", tracerData.valid ? tracerData.loadVoltage : 0.0f);
+    snprintf(line, sizeof(line), "%.1fV", epeverData.valid ? epeverData.loadVoltage : 0.0f);
     lcd.drawStr(92, 18, line);
-    snprintf(line, sizeof(line), "%.1fA", tracerData.valid ? tracerData.loadCurrent : 0.0f);
+    snprintf(line, sizeof(line), "%.1fA", epeverData.valid ? epeverData.loadCurrent : 0.0f);
     lcd.drawStr(92, 28, line);
-    snprintf(line, sizeof(line), "%.0fW", tracerData.valid ? tracerData.loadPowerWatts : 0.0f);
+    snprintf(line, sizeof(line), "%.0fW", epeverData.valid ? epeverData.loadPowerWatts : 0.0f);
     lcd.drawStr(92, 38, line);
 
     Ds1307Time now;
@@ -531,6 +538,9 @@ void drawEnergyWifiScreen()
 
 void updateEnergyCounters()
 {
+    if (epeverEnergyFromController)
+        return;
+
     unsigned long nowMs = millis();
     if (!haveEnergySample)
     {
@@ -551,9 +561,9 @@ void updateEnergyCounters()
 
     float dtHours = (float)(nowMs - lastEnergySampleMs) / 3600000.0f;
     lastEnergySampleMs = nowMs;
-    if (tracerData.valid && tracerData.pvPowerWatts > 0.0f)
+    if (epeverData.valid && epeverData.pvPowerWatts > 0.0f)
     {
-        float wh = tracerData.pvPowerWatts * dtHours;
+        float wh = epeverData.pvPowerWatts * dtHours;
         pvDailyWh += wh;
         pvMonthlyWh += wh;
     }
@@ -650,161 +660,124 @@ uint16_t crc16(const uint8_t *buf, uint16_t len)
     return crc;
 }
 
-void dumpRawFrame(const uint8_t *frame, size_t frameLen, const char *prefix)
+bool modbusReadInputRegisters(uint16_t startRegister, uint16_t registerCount, uint16_t *registers)
 {
-    Serial.printf("%s len=%u: ", prefix, (unsigned)frameLen);
-    for (size_t i = 0; i < frameLen; i++)
-    {
-        Serial.printf("%02X", frame[i]);
-        if (i + 1 < frameLen)
-            Serial.print(' ');
-    }
-    Serial.println();
-}
+    uint8_t request[8] = {
+        MODBUS_SLAVE_ADDRESS,
+        0x04,
+        (uint8_t)(startRegister >> 8),
+        (uint8_t)(startRegister & 0xFF),
+        (uint8_t)(registerCount >> 8),
+        (uint8_t)(registerCount & 0xFF),
+        0,
+        0};
 
-// Decode MT50 live data frame (Function 0x43)
-bool decodeMt50Frame(const uint8_t *frame, size_t frameLen, EpeverTracerData &data)
-{
-    // MT50 0x43 frames are exactly 67 bytes: slave(1) + func(1) + data(63) + crc(2)
-    if (frameLen < 67)
-        return false;
-
-    if (frame[0] != MODBUS_SLAVE_ADDRESS || frame[1] != 0x43)
-        return false;
-
-    // Validate CRC (last 2 bytes, little-endian)
-    uint16_t frameCrc = ((uint16_t)frame[frameLen - 1] << 8) | frame[frameLen - 2];
-    uint16_t calcCrc = crc16(frame, (uint16_t)(frameLen - 2));
-    if (frameCrc != calcCrc)
-    {
-        Serial.printf("MT50: CRC mismatch at frame, frameCRC=0x%04X calcCRC=0x%04X\n", frameCrc, calcCrc);
-        dumpRawFrame(frame, frameLen, "MT50 raw frame");
-        return false;
-    }
-
-    EpeverTracerData fresh;
-
-    // Extract 16-bit big-endian values from frame
-    // Based on working sniffer: offsets are byte positions in the frame
-    auto getU16BE = [&](size_t byteOffset) -> uint16_t {
-        return ((uint16_t)frame[byteOffset] << 8) | frame[byteOffset + 1];
-    };
-
-    // Offsets based on the working example (where bytes are numbered from 0)
-    // PV Voltage at byte 18-19
-    fresh.pvVoltage = getU16BE(18) / 100.0f;
-
-    // PV Current at byte 20-21
-    fresh.pvCurrent = getU16BE(20) / 100.0f;
-
-    // PV Power
-    fresh.pvPowerWatts = fresh.pvVoltage * fresh.pvCurrent;
-
-    // Battery Voltage at byte 26-27
-    fresh.batteryVoltage = getU16BE(26) / 100.0f;
-
-    // Load Voltage at byte 34-35
-    fresh.loadVoltage = getU16BE(34) / 100.0f;
-
-    // Load Current at byte 36-37
-    fresh.loadCurrent = getU16BE(36) / 100.0f;
-
-    // Battery Current = PV Current - Load Current (charge controller logic)
-    fresh.batteryCurrent = fresh.pvCurrent - fresh.loadCurrent;
-
-    // SOC fallback derived from battery voltage when MT50 SOC is unavailable in the frame.
-    float nominal = (fresh.batteryVoltage > 20.0f) ? 24.0f : 12.0f;
-    float emptyV = nominal * 0.975f;
-    float fullV = nominal * 1.10f;
-    float socf = (fresh.batteryVoltage - emptyV) * 100.0f / (fullV - emptyV);
-    if (socf < 0.0f)
-        socf = 0.0f;
-    if (socf > 100.0f)
-        socf = 100.0f;
-    fresh.batterySoc = (uint16_t)(socf + 0.5f);
-
-    // Power calculations
-    fresh.batteryPowerWatts = fresh.batteryVoltage * fresh.batteryCurrent;
-    fresh.loadPowerWatts = fresh.loadVoltage * fresh.loadCurrent;
-
-    fresh.valid = true;
-    data = fresh;
-
-    Serial.printf("MT50: PV=%.2fV*%.2fA=%.1fW, BAT=%.2fV*%.2fA=%.2fW, LOAD=%.2fV*%.2fA=%.1fW\n",
-                  fresh.pvVoltage, fresh.pvCurrent, fresh.pvPowerWatts,
-                  fresh.batteryVoltage, fresh.batteryCurrent, fresh.batteryPowerWatts,
-                  fresh.loadVoltage, fresh.loadCurrent, fresh.loadPowerWatts);
-
-    return true;}
-
-// Process incoming MT50 frames from Serial1 buffer
-void processMt50Stream()
-{
-    static uint8_t frameBuf[128];
-    static size_t frameIdx = 0;
-    static unsigned long lastByteTime = 0;
+    uint16_t requestCrc = crc16(request, 6);
+    request[6] = (uint8_t)(requestCrc & 0xFF);
+    request[7] = (uint8_t)(requestCrc >> 8);
 
     while (Serial1.available())
+        Serial1.read();
+
+    digitalWrite(RS485_DE_PIN, HIGH);
+    delayMicroseconds(200);
+    Serial1.write(request, sizeof(request));
+    Serial1.flush();
+    delayMicroseconds(200);
+    digitalWrite(RS485_DE_PIN, LOW);
+
+    const size_t expectedBytes = 5 + (size_t)registerCount * 2;
+    uint8_t response[64] = {0};
+    size_t received = 0;
+    unsigned long startMs = millis();
+    while (received < expectedBytes && millis() - startMs < MODBUS_RESPONSE_TIMEOUT_MS)
     {
-        uint8_t byte = (uint8_t)Serial1.read();
-        lastByteTime = millis();
-
-        frameBuf[frameIdx++] = byte;
-        if (frameIdx >= sizeof(frameBuf))
-            frameIdx = 0;  // Overflow protection
-
-        // Look for frame sync pattern: 01 43
-        if (frameIdx >= 2)
-        {
-            for (size_t i = 0; i + 1 < frameIdx; i++)
-            {
-                if (frameBuf[i] == MODBUS_SLAVE_ADDRESS && frameBuf[i + 1] == 0x43)
-                {
-                    // Found potential frame start
-                    size_t frameStart = i;
-                    size_t availableBytes = frameIdx - frameStart;
-
-                    if (availableBytes >= 67)
-                    {
-                        // Try to decode this frame
-                        if (decodeMt50Frame(&frameBuf[frameStart], 67, tracerData))
-                        {
-                            dumpRawFrame(&frameBuf[frameStart], 67, "MT50 raw frame (valid)");
-                            lastMt50FrameMs = millis();
-                            // Remove decoded frame from buffer
-                            if (frameStart + 67 < frameIdx)
-                                memmove(frameBuf, &frameBuf[frameStart + 67], frameIdx - frameStart - 67);
-                            frameIdx = frameIdx - frameStart - 67;
-                            return;
-                        }
-                        // If CRC failed, discard one byte and keep searching for the next sync.
-                        size_t dropCount = frameStart + 1;
-                        if (dropCount < frameIdx)
-                        {
-                            memmove(frameBuf, &frameBuf[dropCount], frameIdx - dropCount);
-                            frameIdx -= dropCount;
-                        }
-                        else
-                        {
-                            frameIdx = 0;
-                        }
-                        return;
-                    }
-                    break;
-                }
-            }
-        }
+        while (Serial1.available() && received < expectedBytes)
+            response[received++] = (uint8_t)Serial1.read();
     }
+
+    if (received != expectedBytes)
+        return false;
+    if (response[0] != MODBUS_SLAVE_ADDRESS || response[1] != 0x04 || response[2] != registerCount * 2)
+        return false;
+
+    uint16_t responseCrc = ((uint16_t)response[expectedBytes - 1] << 8) | response[expectedBytes - 2];
+    uint16_t calcCrc = crc16(response, (uint16_t)(expectedBytes - 2));
+    if (responseCrc != calcCrc)
+        return false;
+
+    for (uint16_t i = 0; i < registerCount; i++)
+        registers[i] = ((uint16_t)response[3 + i * 2] << 8) | response[4 + i * 2];
+    return true;
 }
 
-void refreshTracerDataIfNeeded()
+uint32_t modbusU32LowHigh(const uint16_t *registers, uint16_t startIndex)
 {
-    // Passive listener - just process incoming frames
-    processMt50Stream();
+    return (uint32_t)registers[startIndex] | ((uint32_t)registers[startIndex + 1] << 16);
+}
 
-    // Mark data as invalid if no frame received for 10 seconds
-    if (millis() - lastMt50FrameMs > 10000UL)
-        tracerData.valid = false;
+bool pollEpeverData(EpeverTracerData &data)
+{
+    uint16_t liveRegisters[27] = {0};
+    uint16_t energyRegisters[4] = {0};
+
+    if (!modbusReadInputRegisters(REG_PV_VOLTAGE, 27, liveRegisters))
+        return false;
+
+    EpeverTracerData fresh;
+    fresh.pvVoltage = liveRegisters[REG_PV_VOLTAGE - REG_PV_VOLTAGE] / 100.0f;
+    fresh.pvCurrent = liveRegisters[REG_PV_CURRENT - REG_PV_VOLTAGE] / 100.0f;
+    fresh.batteryVoltage = liveRegisters[REG_BATTERY_VOLTAGE - REG_PV_VOLTAGE] / 100.0f;
+    fresh.batteryCurrent = liveRegisters[REG_BATTERY_CURRENT - REG_PV_VOLTAGE] / 100.0f;
+    fresh.loadVoltage = liveRegisters[REG_LOAD_VOLTAGE - REG_PV_VOLTAGE] / 100.0f;
+    fresh.loadCurrent = liveRegisters[REG_LOAD_CURRENT - REG_PV_VOLTAGE] / 100.0f;
+    fresh.batterySoc = liveRegisters[REG_BATTERY_SOC - REG_PV_VOLTAGE];
+    fresh.pvPowerWatts = fresh.pvVoltage * fresh.pvCurrent;
+    fresh.batteryPowerWatts = fresh.batteryVoltage * fresh.batteryCurrent;
+    fresh.loadPowerWatts = fresh.loadVoltage * fresh.loadCurrent;
+    fresh.valid = true;
+
+    if (fresh.batterySoc > 100)
+        fresh.batterySoc = 100;
+
+    if (modbusReadInputRegisters(REG_DAILY_GENERATED_ENERGY, 4, energyRegisters))
+    {
+        epeverEnergyFromController = true;
+        pvDailyWh = modbusU32LowHigh(energyRegisters, 0) * 10.0f;
+        pvMonthlyWh = modbusU32LowHigh(energyRegisters, 2) * 10.0f;
+    }
+
+    data = fresh;
+    return true;
+}
+
+void refreshEpeverDataIfNeeded()
+{
+    unsigned long nowMs = millis();
+    if (nowMs - lastEpeverPollMs < MODBUS_POLL_INTERVAL_MS)
+    {
+        if (nowMs - lastEpeverDataMs > 10000UL)
+            epeverData.valid = false;
+        return;
+    }
+
+    lastEpeverPollMs = nowMs;
+
+    EpeverTracerData fresh;
+    if (pollEpeverData(fresh))
+    {
+        epeverData = fresh;
+        lastEpeverDataMs = nowMs;
+        Serial.printf("Epever: PV=%.2fV %.2fA %.1fW, BAT=%.2fV %.2fA %.2fW, LOAD=%.2fV %.2fA %.1fW, SOC=%u%%\n",
+                      fresh.pvVoltage, fresh.pvCurrent, fresh.pvPowerWatts,
+                      fresh.batteryVoltage, fresh.batteryCurrent, fresh.batteryPowerWatts,
+                      fresh.loadVoltage, fresh.loadCurrent, fresh.loadPowerWatts,
+                      fresh.batterySoc);
+        return;
+    }
+
+    if (nowMs - lastEpeverDataMs > 10000UL)
+        epeverData.valid = false;
 }
 
 bool initRtc()
@@ -1078,7 +1051,7 @@ if(r->method()==HTTP_GET) r->redirect(String("http://") + apIP.toString() + "/")
 // API handlers
 void apiStatus(AsyncWebServerRequest *request)
 {
-    refreshTracerDataIfNeeded();
+    refreshEpeverDataIfNeeded();
 
     DynamicJsonDocument doc(512);
     String rtcDisplay = "";
@@ -1093,15 +1066,15 @@ void apiStatus(AsyncWebServerRequest *request)
         }
     }
     doc["uptimeMin"] = millis() / 60000UL;
-    doc["batteryV"] = tracerData.valid ? tracerData.batteryVoltage : 0.0f;
-    doc["solarW"] = tracerData.valid ? (tracerData.pvVoltage * tracerData.pvCurrent) : 0.0f;
-    doc["pvVoltage"] = tracerData.valid ? tracerData.pvVoltage : 0.0f;
-    doc["pvCurrent"] = tracerData.valid ? tracerData.pvCurrent : 0.0f;
-    doc["batteryVoltage"] = tracerData.valid ? tracerData.batteryVoltage : 0.0f;
-    doc["batteryCurrent"] = tracerData.valid ? tracerData.batteryCurrent : 0.0f;
-    doc["loadVoltage"] = tracerData.valid ? tracerData.loadVoltage : 0.0f;
-    doc["loadCurrent"] = tracerData.valid ? tracerData.loadCurrent : 0.0f;
-    doc["tracerValid"] = tracerData.valid;
+    doc["batteryV"] = epeverData.valid ? epeverData.batteryVoltage : 0.0f;
+    doc["solarW"] = epeverData.valid ? (epeverData.pvVoltage * epeverData.pvCurrent) : 0.0f;
+    doc["pvVoltage"] = epeverData.valid ? epeverData.pvVoltage : 0.0f;
+    doc["pvCurrent"] = epeverData.valid ? epeverData.pvCurrent : 0.0f;
+    doc["batteryVoltage"] = epeverData.valid ? epeverData.batteryVoltage : 0.0f;
+    doc["batteryCurrent"] = epeverData.valid ? epeverData.batteryCurrent : 0.0f;
+    doc["loadVoltage"] = epeverData.valid ? epeverData.loadVoltage : 0.0f;
+    doc["loadCurrent"] = epeverData.valid ? epeverData.loadCurrent : 0.0f;
+    doc["tracerValid"] = epeverData.valid;
     doc["pump1Active"] = (activeRuns[0].active || activeRuns[1].active);
     doc["pump2Active"] = (activeRuns[2].active || activeRuns[3].active);
     doc["apActive"] = apActive;
@@ -1382,7 +1355,8 @@ void setup()
     pinMode(RS485_DE_PIN, OUTPUT);
     digitalWrite(RS485_DE_PIN, LOW);
     Serial1.begin(MODBUS_BAUD_RATE, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
-    Serial.printf("RS485 UART1 ready on pins TX=%d RX=%d DE=%d (passive MT50 listener)\n", RS485_TX_PIN, RS485_RX_PIN, RS485_DE_PIN);
+    Serial1.setTimeout(MODBUS_RESPONSE_TIMEOUT_MS);
+    Serial.printf("RS485 UART1 ready on pins TX=%d RX=%d DE=%d (active Epever Modbus polling)\n", RS485_TX_PIN, RS485_RX_PIN, RS485_DE_PIN);
     setPumpPins();
     Serial.printf("LCD: ST7920 software SPI SCK=%d MOSI=%d CS=%d\n", LCD_SCK_PIN, LCD_MOSI_PIN, LCD_CS_PIN);
     lcd.begin();
@@ -1396,7 +1370,7 @@ void setup()
     startAP();
     setupServerRoutes();
     server.begin();
-    refreshTracerDataIfNeeded();
+    refreshEpeverDataIfNeeded();
     lastScreenSwitchMs = millis();
     lastFlowAnimMs = millis();
     lastLcdRefreshMs = 0;
@@ -1405,7 +1379,7 @@ void setup()
 void loop()
 {
     dnsServer.processNextRequest();
-    refreshTracerDataIfNeeded();
+    refreshEpeverDataIfNeeded();
     if (apActive && (millis() - apStartMillis > AP_TIMEOUT_MS))
         stopAP();
     static unsigned long lastButton = 0;
