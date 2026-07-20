@@ -9,6 +9,8 @@
 #include <Wire.h>
 #include <HardwareSerial.h>
 #include <U8g2lib.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 #ifndef RTC_ENABLED_DEFAULT
 #define RTC_ENABLED_DEFAULT 1
@@ -16,6 +18,10 @@
 
 #ifndef RTC_DEBUG_DEFAULT
 #define RTC_DEBUG_DEFAULT 0
+#endif
+
+#ifndef USB_CDC_STARTUP_WAIT_MS
+#define USB_CDC_STARTUP_WAIT_MS 0
 #endif
 
 using namespace fs;
@@ -26,9 +32,9 @@ static const char *AP_PASSWORD = ""; // open AP
 static const IPAddress apIP(192, 168, 4, 1);
 static const uint8_t DNS_PORT = 53;
 static const uint32_t AP_TIMEOUT_MS = 15UL * 60UL * 1000UL;
-static const int RESTART_BUTTON_PIN = 0;
+static const int RESTART_AP_BUTTON_PIN = 0;
 static const int PUMP1_PIN = 37;
-static const int PUMP2_PIN = 38; // must not overlap the RS485 UART pins
+static const int PUMP2_PIN = 38; 
 static const int I2C_SDA_PIN = 8;
 static const int I2C_SCL_PIN = 9;
 static const int RS485_DE_PIN = 15;
@@ -49,10 +55,12 @@ static const uint16_t REG_LOAD_CURRENT = 0x310D;
 static DNSServer dnsServer;
 static AsyncWebServer server(80);
 static Preferences prefs;
-static bool rtcPresent = false;
+static bool rtcPresent = true;
 static bool rtcEnabled = RTC_ENABLED_DEFAULT != 0;
 static bool rtcDebug = RTC_DEBUG_DEFAULT != 0;
 static bool rtcBusStarted = false;
+static unsigned long lastRtcProbeMs = 0;
+static SemaphoreHandle_t rtcI2cMutex = nullptr;
 static U8G2_ST7920_128X64_F_SW_SPI lcd(U8G2_R0, LCD_SCK_PIN, LCD_MOSI_PIN, LCD_CS_PIN, U8X8_PIN_NONE);
 
 // MT50 frame listening
@@ -103,6 +111,49 @@ struct Ds1307Time
     uint8_t minute;
     uint8_t second;
 };
+
+bool initRtc();
+
+void ensureRtcMutex()
+{
+    if (rtcI2cMutex == nullptr)
+        rtcI2cMutex = xSemaphoreCreateMutex();
+}
+
+bool lockRtcI2C(TickType_t timeoutTicks = pdMS_TO_TICKS(100))
+{
+    ensureRtcMutex();
+    return rtcI2cMutex != nullptr && xSemaphoreTake(rtcI2cMutex, timeoutTicks) == pdTRUE;
+}
+
+void unlockRtcI2C()
+{
+    if (rtcI2cMutex != nullptr)
+        xSemaphoreGive(rtcI2cMutex);
+}
+
+void waitForUsbSerial(unsigned long timeoutMs = USB_CDC_STARTUP_WAIT_MS)
+{
+    if (timeoutMs == 0)
+        return;
+
+    unsigned long startMs = millis();
+    while (!Serial && (millis() - startMs) < timeoutMs)
+        delay(10);
+}
+
+void logStartupBanner()
+{
+    Serial.println();
+    Serial.println("=== Garden Computer Boot ===");
+    Serial.printf("Build: %s %s\n", __DATE__, __TIME__);
+    Serial.printf("CPU: ESP32-S3 @ %lu MHz\n", (unsigned long)getCpuFrequencyMhz());
+    Serial.printf("Flash config: board=%s fs=littlefs\n", "esp32-s3-devkitc-1");
+    Serial.printf("Pins: I2C SDA=%d SCL=%d | LCD CS=%d MOSI=%d SCK=%d | RS485 TX=%d RX=%d DE=%d\n",
+                  I2C_SDA_PIN, I2C_SCL_PIN,
+                  LCD_CS_PIN, LCD_MOSI_PIN, LCD_SCK_PIN,
+                  RS485_TX_PIN, RS485_RX_PIN, RS485_DE_PIN);
+}
 
 bool isLeapYear(uint16_t year)
 {
@@ -225,15 +276,33 @@ bool ds1307WriteRegister(uint8_t reg, uint8_t value)
     return Wire.endTransmission() == 0;
 }
 
+void ensureRtcBusStarted()
+{
+    if (rtcBusStarted)
+        return;
+
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+    Wire.setClock(100000);
+    rtcBusStarted = true;
+}
+
+void resetRtcBus()
+{
+    if (rtcBusStarted)
+        Wire.end();
+    rtcBusStarted = false;
+    ensureRtcBusStarted();
+}
+
 bool ds1307ReadTime(Ds1307Time &time)
 {
     uint8_t regs[7] = {0};
 
     Wire.beginTransmission(0x68);
     Wire.write(0x00);
-    if (Wire.endTransmission(false) != 0)
+    if (Wire.endTransmission(true) != 0)
         return false;
-    if (Wire.requestFrom(0x68, 7) != 7)
+    if (Wire.requestFrom(0x68, 7, true) != 7)
         return false;
 
     for (int i = 0; i < 7; i++)
@@ -246,6 +315,63 @@ bool ds1307ReadTime(Ds1307Time &time)
     time.month = bcdToDec(regs[5] & 0x1F);
     time.year = 2000 + bcdToDec(regs[6]);
     return true;
+}
+
+bool readRtcDateTime(Ds1307Time &time)
+{
+    if (!rtcEnabled)
+        return false;
+
+    if (!lockRtcI2C())
+    {
+        if (rtcDebug)
+            Serial.println("RTC I2C lock timeout");
+        return false;
+    }
+
+    if (!rtcPresent)
+    {
+        if (millis() - lastRtcProbeMs < 5000UL)
+        {
+            unlockRtcI2C();
+            return false;
+        }
+        unlockRtcI2C();
+        initRtc();
+        if (!rtcPresent)
+            return false;
+
+        if (!lockRtcI2C())
+        {
+            if (rtcDebug)
+                Serial.println("RTC I2C relock timeout");
+            return false;
+        }
+    }
+
+    ensureRtcBusStarted();
+    if (ds1307ReadTime(time))
+    {
+        unlockRtcI2C();
+        return true;
+    }
+
+    if (rtcDebug)
+        Serial.println("RTC read failed, resetting I2C bus and retrying");
+
+    resetRtcBus();
+    if (ds1307ReadTime(time))
+    {
+        unlockRtcI2C();
+        return true;
+    }
+
+    rtcPresent = false;
+    lastRtcProbeMs = millis();
+    if (rtcDebug)
+        Serial.println("RTC read retry failed; will reprobe later");
+    unlockRtcI2C();
+    return false;
 }
 
 uint8_t rtcDayOfWeekFromIndex(uint8_t weekdayIndex)
@@ -297,6 +423,14 @@ String formatRtcTimeInput(const Ds1307Time &now)
     return String(buf);
 }
 
+String formatRtcBottomLine(const Ds1307Time &now)
+{
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%02u.%02u.%04u %02u:%02u",
+             now.day, now.month, now.year, now.hour, now.second);
+    return String(buf);
+}
+
 void drawPvIcon(int16_t x, int16_t baselineY)
 {
     int16_t y = baselineY - 12;
@@ -343,65 +477,56 @@ void drawFlowChevrons(int16_t x, int16_t y, bool enabled)
 
 void drawPowerFlowScreen()
 {
-    int16_t baseY = 16;
-    int16_t pvX = 8;
-    int16_t batX = 56;
-    int16_t loadX = 104;
-
-    drawPvIcon(pvX, baseY);
-    drawBatteryIcon(batX, baseY, tracerData.batterySoc);
-    drawLoadIcon(loadX, baseY);
-
-    bool pvToBat = tracerData.valid && tracerData.pvPowerWatts > 0.5f && tracerData.batteryCurrent > 0.05f;
-    bool batToLoad = tracerData.valid && tracerData.loadPowerWatts > 0.5f;
     lcd.setFont(u8g2_font_5x7_tf);
-    drawFlowChevrons(38, 14, pvToBat);
-    drawFlowChevrons(82, 14, batToLoad);
 
-    char line[24];
-    lcd.drawStr(2, 27, "PV");
+    char line[28];
+    lcd.drawStr(2, 8, "PV");
+    lcd.drawStr(47, 8, "BAT");
+    lcd.drawStr(92, 8, "LOAD");
+
     snprintf(line, sizeof(line), "%.1fV", tracerData.valid ? tracerData.pvVoltage : 0.0f);
-    lcd.drawStr(2, 36, line);
+    lcd.drawStr(2, 18, line);
     snprintf(line, sizeof(line), "%.1fA", tracerData.valid ? tracerData.pvCurrent : 0.0f);
-    lcd.drawStr(2, 45, line);
+    lcd.drawStr(2, 28, line);
     snprintf(line, sizeof(line), "%.0fW", tracerData.valid ? tracerData.pvPowerWatts : 0.0f);
-    lcd.drawStr(2, 54, line);
+    lcd.drawStr(2, 38, line);
 
-    lcd.drawStr(47, 27, "BAT");
     snprintf(line, sizeof(line), "%.1fV", tracerData.valid ? tracerData.batteryVoltage : 0.0f);
-    lcd.drawStr(47, 36, line);
+    lcd.drawStr(47, 18, line);
     snprintf(line, sizeof(line), "%.1fA", tracerData.valid ? tracerData.batteryCurrent : 0.0f);
-    lcd.drawStr(47, 45, line);
+    lcd.drawStr(47, 28, line);
     snprintf(line, sizeof(line), "%.0fW", tracerData.valid ? tracerData.batteryPowerWatts : 0.0f);
-    lcd.drawStr(47, 54, line);
-
-    lcd.drawStr(92, 27, "LOAD");
-    snprintf(line, sizeof(line), "%.1fV", tracerData.valid ? tracerData.loadVoltage : 0.0f);
-    lcd.drawStr(92, 36, line);
-    snprintf(line, sizeof(line), "%.1fA", tracerData.valid ? tracerData.loadCurrent : 0.0f);
-    lcd.drawStr(92, 45, line);
-    snprintf(line, sizeof(line), "%.0fW", tracerData.valid ? tracerData.loadPowerWatts : 0.0f);
-    lcd.drawStr(92, 54, line);
-
+    lcd.drawStr(47, 38, line);
     snprintf(line, sizeof(line), "SOC %u%%", tracerData.batterySoc);
-    lcd.drawStr(42, 63, line);
+    lcd.drawStr(47, 48, line);
+
+    snprintf(line, sizeof(line), "%.1fV", tracerData.valid ? tracerData.loadVoltage : 0.0f);
+    lcd.drawStr(92, 18, line);
+    snprintf(line, sizeof(line), "%.1fA", tracerData.valid ? tracerData.loadCurrent : 0.0f);
+    lcd.drawStr(92, 28, line);
+    snprintf(line, sizeof(line), "%.0fW", tracerData.valid ? tracerData.loadPowerWatts : 0.0f);
+    lcd.drawStr(92, 38, line);
+
+    Ds1307Time now;
+    if (readRtcDateTime(now))
+        lcd.drawStr(2, 63, formatRtcBottomLine(now).c_str());
 }
 
 void drawEnergyWifiScreen()
 {
-    char line[32];
-    lcd.setFont(u8g2_font_6x12_tf);
-    lcd.drawStr(2, 13, "PV Production");
-
+    char line[40];
     lcd.setFont(u8g2_font_5x7_tf);
     snprintf(line, sizeof(line), "Daily:   %.2f kWh", pvDailyWh / 1000.0f);
-    lcd.drawStr(2, 27, line);
+    lcd.drawStr(2, 12, line);
     snprintf(line, sizeof(line), "Monthly: %.2f kWh", pvMonthlyWh / 1000.0f);
-    lcd.drawStr(2, 38, line);
+    lcd.drawStr(2, 24, line);
 
-    snprintf(line, sizeof(line), "WiFi AP: %s", apActive ? "ON" : "OFF");
-    lcd.drawStr(2, 52, line);
-    lcd.drawStr(2, 62, makeApName().c_str());
+    lcd.setFont(u8g2_font_4x6_tf);
+    if (apActive)
+        snprintf(line, sizeof(line), "WiFi AP: ON %s", makeApName().c_str());
+    else
+        snprintf(line, sizeof(line), "WiFi AP: OFF");
+    lcd.drawStr(2, 38, line);
 }
 
 void updateEnergyCounters()
@@ -411,10 +536,10 @@ void updateEnergyCounters()
     {
         lastEnergySampleMs = nowMs;
         haveEnergySample = true;
-        if (rtcPresent)
+        if (rtcEnabled)
         {
             Ds1307Time now;
-            if (ds1307ReadTime(now))
+            if (readRtcDateTime(now))
             {
                 energyYear = now.year;
                 energyMonth = now.month;
@@ -433,10 +558,10 @@ void updateEnergyCounters()
         pvMonthlyWh += wh;
     }
 
-    if (rtcPresent)
+    if (rtcEnabled)
     {
         Ds1307Time now;
-        if (ds1307ReadTime(now))
+        if (readRtcDateTime(now))
         {
             if (energyYear == 0)
             {
@@ -692,49 +817,66 @@ bool initRtc()
         return false;
     }
 
-    if (!rtcBusStarted)
+    if (!lockRtcI2C())
     {
-        Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-        rtcBusStarted = true;
+        if (rtcDebug)
+            Serial.println("RTC init lock timeout");
+        return false;
     }
+
+    ensureRtcBusStarted();
+    lastRtcProbeMs = millis();
 
     Wire.beginTransmission(0x68);
     Wire.write(0x00);
-    rtcPresent = (Wire.endTransmission(false) == 0);
+    rtcPresent = (Wire.endTransmission(true) == 0);
     if (!rtcPresent)
     {
         if (rtcDebug)
             Serial.println("DS1307 not found on I2C");
+        unlockRtcI2C();
         return false;
     }
 
     Ds1307Time now;
     if (!ds1307ReadTime(now))
     {
-        rtcPresent = false;
+        resetRtcBus();
+        rtcPresent = ds1307ReadTime(now);
+    }
+
+    if (!rtcPresent)
+    {
         if (rtcDebug)
-            Serial.println("DS1307 probe read failed; RTC disabled");
+            Serial.println("DS1307 probe read failed; RTC will retry later");
+        unlockRtcI2C();
         return false;
     }
 
     if (rtcDebug)
         Serial.println("DS1307 ready");
+    unlockRtcI2C();
     return true;
 }
 
 bool readRtcTime(uint8_t &hour, uint8_t &minute, uint8_t &weekdayIndex, uint32_t &dayIndex, String &display)
 {
     if (!rtcEnabled || !rtcPresent)
-        return false;
+    {
+        Ds1307Time now;
+        if (!readRtcDateTime(now))
+            return false;
+        hour = now.hour;
+        minute = now.minute;
+        weekdayIndex = dayOfWeekFromDate(now.year, now.month, now.day);
+        dayIndex = daysSince2000(now.year, now.month, now.day);
+        display = formatRtcDateTime(now);
+        return true;
+    }
 
     Ds1307Time now;
-    if (!ds1307ReadTime(now))
-    {
-        rtcPresent = false;
-        if (rtcDebug)
-            Serial.println("RTC read failed; falling back to uptime clock");
+    if (!readRtcDateTime(now))
         return false;
-    }
 
     hour = now.hour;
     minute = now.minute;
@@ -942,18 +1084,12 @@ void apiStatus(AsyncWebServerRequest *request)
     String rtcDisplay = "";
     bool rtcReadOk = false;
     Ds1307Time now;
-    if (rtcEnabled && rtcPresent)
+    if (rtcEnabled)
     {
-        if (ds1307ReadTime(now))
+        if (readRtcDateTime(now))
         {
             rtcDisplay = formatRtcDateTime(now);
             rtcReadOk = true;
-        }
-        else
-        {
-            rtcPresent = false;
-            if (rtcDebug)
-                Serial.println("RTC status read failed; disabling RTC access");
         }
     }
     doc["uptimeMin"] = millis() / 60000UL;
@@ -1113,7 +1249,16 @@ void handleDeleteSchedule(AsyncWebServerRequest *request)
 
 void handleSetRtc(AsyncWebServerRequest *request)
 {
-    if (!rtcEnabled || !rtcPresent)
+    if (!rtcEnabled)
+    {
+        request->send(500, "application/json", "{\"ok\":0,\"error\":\"RTC unavailable\"}");
+        return;
+    }
+
+    if (!rtcPresent)
+        initRtc();
+
+    if (!rtcPresent)
     {
         request->send(500, "application/json", "{\"ok\":0,\"error\":\"RTC unavailable\"}");
         return;
@@ -1127,9 +1272,23 @@ void handleSetRtc(AsyncWebServerRequest *request)
     time.minute = request->hasArg("minute") ? request->arg("minute").toInt() : 0;
     time.second = request->hasArg("second") ? request->arg("second").toInt() : 0;
 
+    if (!lockRtcI2C())
+    {
+        request->send(500, "application/json", "{\"ok\":0,\"error\":\"RTC busy\"}");
+        return;
+    }
+
+    ensureRtcBusStarted();
     bool ok = ds1307WriteTime(time);
     if (!ok)
-        rtcPresent = false;
+    {
+        resetRtcBus();
+        ok = ds1307WriteTime(time);
+        rtcPresent = ok;
+        if (!ok)
+            lastRtcProbeMs = millis();
+    }
+    unlockRtcI2C();
     request->send(ok ? 200 : 500, "application/json", ok ? "{\"ok\":1}" : "{\"ok\":0,\"error\":\"write failed\"}");
 }
 
@@ -1141,10 +1300,14 @@ void handleRtcConfig(AsyncWebServerRequest *request)
         if (!rtcEnabled)
         {
             rtcPresent = false;
-            if (rtcBusStarted)
+            if (lockRtcI2C())
             {
-                Wire.end();
-                rtcBusStarted = false;
+                if (rtcBusStarted)
+                {
+                    Wire.end();
+                    rtcBusStarted = false;
+                }
+                unlockRtcI2C();
             }
             if (rtcDebug)
                 Serial.println("RTC disabled via API");
@@ -1194,7 +1357,10 @@ void setupServerRoutes()
 void setup()
 {
     Serial.begin(115200);
-    delay(200);
+    waitForUsbSerial();
+    delay(50);
+    ensureRtcMutex();
+    logStartupBanner();
     if (PUMP1_PIN == RS485_TX_PIN || PUMP1_PIN == RS485_RX_PIN || PUMP1_PIN == RS485_DE_PIN ||
         PUMP2_PIN == RS485_TX_PIN || PUMP2_PIN == RS485_RX_PIN || PUMP2_PIN == RS485_DE_PIN)
     {
@@ -1206,8 +1372,13 @@ void setup()
         Serial.println("LittleFS mounted");
     prefs.begin("gc", false);
     loadSchedules();
+    Serial.printf("Schedules loaded: %u\n", scheduleCount);
     initRtc();
-    pinMode(RESTART_BUTTON_PIN, INPUT_PULLUP);
+    Serial.printf("RTC config: enabled=%s present=%s debug=%s\n",
+                  rtcEnabled ? "yes" : "no",
+                  rtcPresent ? "yes" : "no",
+                  rtcDebug ? "yes" : "no");
+    pinMode(RESTART_AP_BUTTON_PIN, INPUT_PULLUP);
     pinMode(RS485_DE_PIN, OUTPUT);
     digitalWrite(RS485_DE_PIN, LOW);
     Serial1.begin(MODBUS_BAUD_RATE, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
@@ -1238,7 +1409,7 @@ void loop()
     if (apActive && (millis() - apStartMillis > AP_TIMEOUT_MS))
         stopAP();
     static unsigned long lastButton = 0;
-    if (digitalRead(RESTART_BUTTON_PIN) == LOW)
+    if (digitalRead(RESTART_AP_BUTTON_PIN) == LOW)
     {
         if (millis() - lastButton > 800)
         {
