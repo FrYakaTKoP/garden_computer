@@ -8,6 +8,15 @@
 #include <Preferences.h>
 #include <Wire.h>
 #include <HardwareSerial.h>
+#include <U8g2lib.h>
+
+#ifndef RTC_ENABLED_DEFAULT
+#define RTC_ENABLED_DEFAULT 1
+#endif
+
+#ifndef RTC_DEBUG_DEFAULT
+#define RTC_DEBUG_DEFAULT 0
+#endif
 
 using namespace fs;
 
@@ -25,6 +34,9 @@ static const int I2C_SCL_PIN = 9;
 static const int RS485_DE_PIN = 15;
 static const int RS485_TX_PIN = 17;
 static const int RS485_RX_PIN = 18;
+static const int LCD_CS_PIN = 10;   // RS on Reprap 12864 (ST7920)
+static const int LCD_MOSI_PIN = 11; // R/W on Reprap 12864 (ST7920)
+static const int LCD_SCK_PIN = 12;  // E on Reprap 12864 (ST7920)
 static const uint8_t MODBUS_SLAVE_ADDRESS = 0x01;
 static const uint32_t MODBUS_BAUD_RATE = 115200;
 static const uint16_t REG_PV_VOLTAGE = 0x3100;
@@ -38,6 +50,10 @@ static DNSServer dnsServer;
 static AsyncWebServer server(80);
 static Preferences prefs;
 static bool rtcPresent = false;
+static bool rtcEnabled = RTC_ENABLED_DEFAULT != 0;
+static bool rtcDebug = RTC_DEBUG_DEFAULT != 0;
+static bool rtcBusStarted = false;
+static U8G2_ST7920_128X64_F_SW_SPI lcd(U8G2_R0, LCD_SCK_PIN, LCD_MOSI_PIN, LCD_CS_PIN, U8X8_PIN_NONE);
 
 // MT50 frame listening
 static unsigned long lastMt50FrameMs = 0;
@@ -61,6 +77,22 @@ struct EpeverTracerData
 };
 
 static EpeverTracerData tracerData;
+
+static uint8_t activeDisplayScreen = 0;
+static unsigned long lastScreenSwitchMs = 0;
+static unsigned long lastLcdRefreshMs = 0;
+static unsigned long lastFlowAnimMs = 0;
+static uint8_t flowAnimState = 0;
+
+static float pvDailyWh = 0.0f;
+static float pvMonthlyWh = 0.0f;
+static unsigned long lastEnergySampleMs = 0;
+static bool haveEnergySample = false;
+static uint16_t energyYear = 0;
+static uint8_t energyMonth = 0;
+static uint8_t energyDay = 0;
+static uint32_t fallbackLastDayBucket = 0;
+static uint32_t fallbackLastMonthBucket = 0;
 
 struct Ds1307Time
 {
@@ -265,6 +297,211 @@ String formatRtcTimeInput(const Ds1307Time &now)
     return String(buf);
 }
 
+void drawPvIcon(int16_t x, int16_t baselineY)
+{
+    int16_t y = baselineY - 12;
+    lcd.drawFrame(x + 3, y + 3, 7, 7);
+    lcd.drawLine(x + 6, y, x + 6, y + 2);
+    lcd.drawLine(x + 6, y + 10, x + 6, y + 12);
+    lcd.drawLine(x, y + 6, x + 2, y + 6);
+    lcd.drawLine(x + 10, y + 6, x + 12, y + 6);
+    lcd.drawLine(x + 1, y + 1, x + 2, y + 2);
+    lcd.drawLine(x + 10, y + 10, x + 11, y + 11);
+    lcd.drawLine(x + 10, y + 1, x + 11, y + 2);
+    lcd.drawLine(x + 1, y + 10, x + 2, y + 11);
+}
+
+void drawBatteryIcon(int16_t x, int16_t baselineY, uint8_t soc)
+{
+    int16_t y = baselineY - 12;
+    lcd.drawFrame(x, y + 2, 14, 8);
+    lcd.drawBox(x + 14, y + 4, 2, 4);
+    uint8_t fill = (uint8_t)((soc > 100 ? 100 : soc) / 10);
+    if (fill > 0)
+        lcd.drawBox(x + 1, y + 3, fill, 6);
+}
+
+void drawLoadIcon(int16_t x, int16_t baselineY)
+{
+    int16_t y = baselineY - 12;
+    lcd.drawCircle(x + 6, y + 6, 4, U8G2_DRAW_ALL);
+    lcd.drawLine(x + 6, y + 10, x + 6, y + 12);
+    lcd.drawLine(x + 4, y + 12, x + 8, y + 12);
+}
+
+void drawFlowChevrons(int16_t x, int16_t y, bool enabled)
+{
+    static const uint8_t sequence[4] = {1, 2, 3, 0};
+    uint8_t visible = enabled ? sequence[flowAnimState] : 0;
+    if (visible >= 1)
+        lcd.drawStr(x, y, ">");
+    if (visible >= 2)
+        lcd.drawStr(x + 6, y, ">");
+    if (visible >= 3)
+        lcd.drawStr(x + 12, y, ">");
+}
+
+void drawPowerFlowScreen()
+{
+    int16_t baseY = 16;
+    int16_t pvX = 8;
+    int16_t batX = 56;
+    int16_t loadX = 104;
+
+    drawPvIcon(pvX, baseY);
+    drawBatteryIcon(batX, baseY, tracerData.batterySoc);
+    drawLoadIcon(loadX, baseY);
+
+    bool pvToBat = tracerData.valid && tracerData.pvPowerWatts > 0.5f && tracerData.batteryCurrent > 0.05f;
+    bool batToLoad = tracerData.valid && tracerData.loadPowerWatts > 0.5f;
+    lcd.setFont(u8g2_font_5x7_tf);
+    drawFlowChevrons(38, 14, pvToBat);
+    drawFlowChevrons(82, 14, batToLoad);
+
+    char line[24];
+    lcd.drawStr(2, 27, "PV");
+    snprintf(line, sizeof(line), "%.1fV", tracerData.valid ? tracerData.pvVoltage : 0.0f);
+    lcd.drawStr(2, 36, line);
+    snprintf(line, sizeof(line), "%.1fA", tracerData.valid ? tracerData.pvCurrent : 0.0f);
+    lcd.drawStr(2, 45, line);
+    snprintf(line, sizeof(line), "%.0fW", tracerData.valid ? tracerData.pvPowerWatts : 0.0f);
+    lcd.drawStr(2, 54, line);
+
+    lcd.drawStr(47, 27, "BAT");
+    snprintf(line, sizeof(line), "%.1fV", tracerData.valid ? tracerData.batteryVoltage : 0.0f);
+    lcd.drawStr(47, 36, line);
+    snprintf(line, sizeof(line), "%.1fA", tracerData.valid ? tracerData.batteryCurrent : 0.0f);
+    lcd.drawStr(47, 45, line);
+    snprintf(line, sizeof(line), "%.0fW", tracerData.valid ? tracerData.batteryPowerWatts : 0.0f);
+    lcd.drawStr(47, 54, line);
+
+    lcd.drawStr(92, 27, "LOAD");
+    snprintf(line, sizeof(line), "%.1fV", tracerData.valid ? tracerData.loadVoltage : 0.0f);
+    lcd.drawStr(92, 36, line);
+    snprintf(line, sizeof(line), "%.1fA", tracerData.valid ? tracerData.loadCurrent : 0.0f);
+    lcd.drawStr(92, 45, line);
+    snprintf(line, sizeof(line), "%.0fW", tracerData.valid ? tracerData.loadPowerWatts : 0.0f);
+    lcd.drawStr(92, 54, line);
+
+    snprintf(line, sizeof(line), "SOC %u%%", tracerData.batterySoc);
+    lcd.drawStr(42, 63, line);
+}
+
+void drawEnergyWifiScreen()
+{
+    char line[32];
+    lcd.setFont(u8g2_font_6x12_tf);
+    lcd.drawStr(2, 13, "PV Production");
+
+    lcd.setFont(u8g2_font_5x7_tf);
+    snprintf(line, sizeof(line), "Daily:   %.2f kWh", pvDailyWh / 1000.0f);
+    lcd.drawStr(2, 27, line);
+    snprintf(line, sizeof(line), "Monthly: %.2f kWh", pvMonthlyWh / 1000.0f);
+    lcd.drawStr(2, 38, line);
+
+    snprintf(line, sizeof(line), "WiFi AP: %s", apActive ? "ON" : "OFF");
+    lcd.drawStr(2, 52, line);
+    lcd.drawStr(2, 62, makeApName().c_str());
+}
+
+void updateEnergyCounters()
+{
+    unsigned long nowMs = millis();
+    if (!haveEnergySample)
+    {
+        lastEnergySampleMs = nowMs;
+        haveEnergySample = true;
+        if (rtcPresent)
+        {
+            Ds1307Time now;
+            if (ds1307ReadTime(now))
+            {
+                energyYear = now.year;
+                energyMonth = now.month;
+                energyDay = now.day;
+            }
+        }
+        return;
+    }
+
+    float dtHours = (float)(nowMs - lastEnergySampleMs) / 3600000.0f;
+    lastEnergySampleMs = nowMs;
+    if (tracerData.valid && tracerData.pvPowerWatts > 0.0f)
+    {
+        float wh = tracerData.pvPowerWatts * dtHours;
+        pvDailyWh += wh;
+        pvMonthlyWh += wh;
+    }
+
+    if (rtcPresent)
+    {
+        Ds1307Time now;
+        if (ds1307ReadTime(now))
+        {
+            if (energyYear == 0)
+            {
+                energyYear = now.year;
+                energyMonth = now.month;
+                energyDay = now.day;
+            }
+            if (now.year != energyYear || now.month != energyMonth)
+            {
+                pvMonthlyWh = 0.0f;
+                pvDailyWh = 0.0f;
+            }
+            else if (now.day != energyDay)
+            {
+                pvDailyWh = 0.0f;
+            }
+            energyYear = now.year;
+            energyMonth = now.month;
+            energyDay = now.day;
+            return;
+        }
+    }
+
+    uint32_t dayBucket = nowMs / 86400000UL;
+    uint32_t monthBucket = nowMs / (30UL * 86400000UL);
+    if (dayBucket != fallbackLastDayBucket)
+    {
+        pvDailyWh = 0.0f;
+        fallbackLastDayBucket = dayBucket;
+    }
+    if (monthBucket != fallbackLastMonthBucket)
+    {
+        pvMonthlyWh = 0.0f;
+        fallbackLastMonthBucket = monthBucket;
+    }
+}
+
+void updateDisplay()
+{
+    unsigned long nowMs = millis();
+
+    if (nowMs - lastScreenSwitchMs >= 20000UL)
+    {
+        activeDisplayScreen = (activeDisplayScreen + 1) % 2;
+        lastScreenSwitchMs = nowMs;
+    }
+
+    if (nowMs - lastFlowAnimMs >= 350UL)
+    {
+        flowAnimState = (flowAnimState + 1) % 4;
+        lastFlowAnimMs = nowMs;
+    }
+
+    if (nowMs - lastLcdRefreshMs < 150UL)
+        return;
+    lastLcdRefreshMs = nowMs;
+
+    lcd.clearBuffer();
+    if (activeDisplayScreen == 0)
+        drawPowerFlowScreen();
+    else
+        drawEnergyWifiScreen();
+    lcd.sendBuffer();
+}
+
 uint16_t crc16(const uint8_t *buf, uint16_t len)
 {
     uint16_t crc = 0xFFFF;
@@ -349,6 +586,17 @@ bool decodeMt50Frame(const uint8_t *frame, size_t frameLen, EpeverTracerData &da
 
     // Battery Current = PV Current - Load Current (charge controller logic)
     fresh.batteryCurrent = fresh.pvCurrent - fresh.loadCurrent;
+
+    // SOC fallback derived from battery voltage when MT50 SOC is unavailable in the frame.
+    float nominal = (fresh.batteryVoltage > 20.0f) ? 24.0f : 12.0f;
+    float emptyV = nominal * 0.975f;
+    float fullV = nominal * 1.10f;
+    float socf = (fresh.batteryVoltage - emptyV) * 100.0f / (fullV - emptyV);
+    if (socf < 0.0f)
+        socf = 0.0f;
+    if (socf > 100.0f)
+        socf = 100.0f;
+    fresh.batterySoc = (uint16_t)(socf + 0.5f);
 
     // Power calculations
     fresh.batteryPowerWatts = fresh.batteryVoltage * fresh.batteryCurrent;
@@ -436,34 +684,57 @@ void refreshTracerDataIfNeeded()
 
 bool initRtc()
 {
-    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-    uint8_t dummy = 0;
+    if (!rtcEnabled)
+    {
+        rtcPresent = false;
+        if (rtcDebug)
+            Serial.println("RTC disabled by config");
+        return false;
+    }
+
+    if (!rtcBusStarted)
+    {
+        Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+        rtcBusStarted = true;
+    }
+
     Wire.beginTransmission(0x68);
     Wire.write(0x00);
     rtcPresent = (Wire.endTransmission(false) == 0);
     if (!rtcPresent)
     {
-        Serial.println("DS1307 not found on I2C");
+        if (rtcDebug)
+            Serial.println("DS1307 not found on I2C");
         return false;
     }
 
-    if (dummy & 0x80)
+    Ds1307Time now;
+    if (!ds1307ReadTime(now))
     {
-        Serial.println("DS1307 was halted; restarting it");
-        ds1307WriteRegister(0x00, dummy & 0x7F);
+        rtcPresent = false;
+        if (rtcDebug)
+            Serial.println("DS1307 probe read failed; RTC disabled");
+        return false;
     }
-    Serial.println("DS1307 ready");
+
+    if (rtcDebug)
+        Serial.println("DS1307 ready");
     return true;
 }
 
 bool readRtcTime(uint8_t &hour, uint8_t &minute, uint8_t &weekdayIndex, uint32_t &dayIndex, String &display)
 {
-    if (!rtcPresent)
+    if (!rtcEnabled || !rtcPresent)
         return false;
 
     Ds1307Time now;
     if (!ds1307ReadTime(now))
+    {
+        rtcPresent = false;
+        if (rtcDebug)
+            Serial.println("RTC read failed; falling back to uptime clock");
         return false;
+    }
 
     hour = now.hour;
     minute = now.minute;
@@ -615,10 +886,8 @@ void checkSchedules()
     uint32_t dayIndex = 0;
     String display;
 
-    if (rtcPresent)
+    if (rtcPresent && readRtcTime(hour, minute, weekday, dayIndex, display))
     {
-        if (!readRtcTime(hour, minute, weekday, dayIndex, display))
-            return;
         uint32_t currentMinute = (uint32_t)hour * 60UL + minute;
         if (currentMinute == lastMinute && dayIndex == lastDayIndex)
             return;
@@ -671,11 +940,21 @@ void apiStatus(AsyncWebServerRequest *request)
 
     DynamicJsonDocument doc(512);
     String rtcDisplay = "";
-    if (rtcPresent)
+    bool rtcReadOk = false;
+    Ds1307Time now;
+    if (rtcEnabled && rtcPresent)
     {
-        Ds1307Time now;
         if (ds1307ReadTime(now))
+        {
             rtcDisplay = formatRtcDateTime(now);
+            rtcReadOk = true;
+        }
+        else
+        {
+            rtcPresent = false;
+            if (rtcDebug)
+                Serial.println("RTC status read failed; disabling RTC access");
+        }
     }
     doc["uptimeMin"] = millis() / 60000UL;
     doc["batteryV"] = tracerData.valid ? tracerData.batteryVoltage : 0.0f;
@@ -691,16 +970,14 @@ void apiStatus(AsyncWebServerRequest *request)
     doc["pump2Active"] = (activeRuns[2].active || activeRuns[3].active);
     doc["apActive"] = apActive;
     doc["ssid"] = makeApName();
+    doc["rtcEnabled"] = rtcEnabled;
+    doc["rtcDebug"] = rtcDebug;
     doc["rtcPresent"] = rtcPresent;
     doc["rtcDisplay"] = rtcDisplay;
-    if (rtcPresent)
+    if (rtcReadOk)
     {
-        Ds1307Time now;
-        if (ds1307ReadTime(now))
-        {
-            doc["rtcDateInput"] = formatRtcDateInput(now);
-            doc["rtcTimeInput"] = formatRtcTimeInput(now);
-        }
+        doc["rtcDateInput"] = formatRtcDateInput(now);
+        doc["rtcTimeInput"] = formatRtcTimeInput(now);
     }
     String out;
     serializeJson(doc, out);
@@ -836,7 +1113,7 @@ void handleDeleteSchedule(AsyncWebServerRequest *request)
 
 void handleSetRtc(AsyncWebServerRequest *request)
 {
-    if (!rtcPresent)
+    if (!rtcEnabled || !rtcPresent)
     {
         request->send(500, "application/json", "{\"ok\":0,\"error\":\"RTC unavailable\"}");
         return;
@@ -851,7 +1128,44 @@ void handleSetRtc(AsyncWebServerRequest *request)
     time.second = request->hasArg("second") ? request->arg("second").toInt() : 0;
 
     bool ok = ds1307WriteTime(time);
+    if (!ok)
+        rtcPresent = false;
     request->send(ok ? 200 : 500, "application/json", ok ? "{\"ok\":1}" : "{\"ok\":0,\"error\":\"write failed\"}");
+}
+
+void handleRtcConfig(AsyncWebServerRequest *request)
+{
+    if (request->hasArg("enabled"))
+    {
+        rtcEnabled = request->arg("enabled").toInt() != 0;
+        if (!rtcEnabled)
+        {
+            rtcPresent = false;
+            if (rtcBusStarted)
+            {
+                Wire.end();
+                rtcBusStarted = false;
+            }
+            if (rtcDebug)
+                Serial.println("RTC disabled via API");
+        }
+        else
+        {
+            initRtc();
+        }
+    }
+
+    if (request->hasArg("debug"))
+        rtcDebug = request->arg("debug").toInt() != 0;
+
+    DynamicJsonDocument doc(256);
+    doc["ok"] = 1;
+    doc["rtcEnabled"] = rtcEnabled;
+    doc["rtcDebug"] = rtcDebug;
+    doc["rtcPresent"] = rtcPresent;
+    String out;
+    serializeJson(doc, out);
+    request->send(200, "application/json", out);
 }
 
 void setupServerRoutes()
@@ -870,6 +1184,10 @@ void setupServerRoutes()
               { handleDeleteSchedule(r); });
     server.on("/api/rtc/set", HTTP_POST, [](AsyncWebServerRequest *r)
               { handleSetRtc(r); });
+    server.on("/api/rtc/config", HTTP_GET, [](AsyncWebServerRequest *r)
+              { handleRtcConfig(r); });
+    server.on("/api/rtc/config", HTTP_POST, [](AsyncWebServerRequest *r)
+              { handleRtcConfig(r); });
     initFileServer();
 }
 
@@ -889,15 +1207,28 @@ void setup()
     prefs.begin("gc", false);
     loadSchedules();
     initRtc();
+    pinMode(RESTART_BUTTON_PIN, INPUT_PULLUP);
     pinMode(RS485_DE_PIN, OUTPUT);
     digitalWrite(RS485_DE_PIN, LOW);
     Serial1.begin(MODBUS_BAUD_RATE, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
     Serial.printf("RS485 UART1 ready on pins TX=%d RX=%d DE=%d (passive MT50 listener)\n", RS485_TX_PIN, RS485_RX_PIN, RS485_DE_PIN);
     setPumpPins();
+    Serial.printf("LCD: ST7920 software SPI SCK=%d MOSI=%d CS=%d\n", LCD_SCK_PIN, LCD_MOSI_PIN, LCD_CS_PIN);
+    lcd.begin();
+    lcd.setContrast(180);
+    lcd.clearBuffer();
+    lcd.setFont(u8g2_font_6x12_tf);
+    lcd.drawStr(2, 14, "Garden Computer");
+    lcd.setFont(u8g2_font_5x7_tf);
+    lcd.drawStr(2, 30, "Reprap 12864 ready");
+    lcd.sendBuffer();
     startAP();
     setupServerRoutes();
     server.begin();
     refreshTracerDataIfNeeded();
+    lastScreenSwitchMs = millis();
+    lastFlowAnimMs = millis();
+    lastLcdRefreshMs = 0;
     Serial.println("Async server started");
 }
 void loop()
@@ -915,6 +1246,8 @@ void loop()
             lastButton = millis();
         }
     }
+    updateEnergyCounters();
+    updateDisplay();
     pumpTick();
     checkSchedules();
     delay(10);
