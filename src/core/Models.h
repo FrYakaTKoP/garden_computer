@@ -51,4 +51,18 @@ struct ActiveRun
     unsigned long endMillis = 0;
     bool active = false;
 };
+
+struct PumpRuntimeStatus
+{
+    bool newPumpsEnabled = false;
+    uint8_t batteryFullThresholdPct = 80;
+    uint32_t autonomousCycleMs = 60000;
+    bool topTankFull = false;
+    bool leftTankEmpty = false;
+    bool leftTankFull = false;
+    bool rightTankEmpty = false;
+    bool rightTankFull = false;
+    uint8_t autonomousPumpMask = 0;
+    uint8_t scheduledPumpMask = 0;
+};
 }

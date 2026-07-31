@@ -59,5 +59,6 @@ private:
     void handleSetRtc(AsyncWebServerRequest *request);
     void handleSyncRtcToEpever(AsyncWebServerRequest *request);
     void handleRtcConfig(AsyncWebServerRequest *request);
+    void handlePumpConfig(AsyncWebServerRequest *request);
 };
 }

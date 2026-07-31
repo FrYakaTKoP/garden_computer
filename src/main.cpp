@@ -36,6 +36,11 @@ static PumpScheduler scheduler(
     prefs,
     gc::config::kPump1Pin,
     gc::config::kPump2Pin,
+    gc::config::kTopTankFullPin,
+    gc::config::kLeftTankEmptyPin,
+    gc::config::kLeftTankFullPin,
+    gc::config::kRightTankEmptyPin,
+    gc::config::kRightTankFullPin,
     gc::config::kMaxSchedules,
     gc::config::kMaxActiveRuns);
 
@@ -142,11 +147,12 @@ void loop()
     display.update(
         portal.isApActive(),
         epever.data(),
+        scheduler.runtimeStatus(),
         epever.pvDailyWh(),
         epever.pvMonthlyWh(),
         epever.pvTotalWh(),
         rtc);
 
-    scheduler.loop(rtc);
+    scheduler.loop(rtc, epever.data());
     delay(10);
 }

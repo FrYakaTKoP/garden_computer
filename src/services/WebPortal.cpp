@@ -140,6 +140,18 @@ void WebPortal::apiStatus(AsyncWebServerRequest *request)
     doc["pump1Active"] = (activeMask & 1) != 0;
     doc["pump2Active"] = (activeMask & 2) != 0;
 
+    const PumpRuntimeStatus runtime = scheduler_.runtimeStatus();
+    doc["newPumpsEnabled"] = runtime.newPumpsEnabled;
+    doc["batteryThresholdPct"] = runtime.batteryFullThresholdPct;
+    doc["autonomousCycleMs"] = runtime.autonomousCycleMs;
+    doc["topTankFull"] = runtime.topTankFull;
+    doc["leftTankEmpty"] = runtime.leftTankEmpty;
+    doc["leftTankFull"] = runtime.leftTankFull;
+    doc["rightTankEmpty"] = runtime.rightTankEmpty;
+    doc["rightTankFull"] = runtime.rightTankFull;
+    doc["autonomousPumpMask"] = runtime.autonomousPumpMask;
+    doc["scheduledPumpMask"] = runtime.scheduledPumpMask;
+
     doc["apActive"] = apActive_;
     doc["ssid"] = ssid();
 
@@ -319,6 +331,38 @@ void WebPortal::handleRtcConfig(AsyncWebServerRequest *request)
     request->send(200, "application/json", out);
 }
 
+void WebPortal::handlePumpConfig(AsyncWebServerRequest *request)
+{
+    bool changed = false;
+    if (request->hasArg("enabled"))
+    {
+        scheduler_.setNewPumpsEnabled(request->arg("enabled").toInt() != 0);
+        changed = true;
+    }
+    if (request->hasArg("threshold"))
+    {
+        scheduler_.setBatteryThresholdPct(static_cast<uint8_t>(request->arg("threshold").toInt()));
+        changed = true;
+    }
+    if (request->hasArg("cycleMs"))
+    {
+        scheduler_.setAutonomousCycleMs(static_cast<uint32_t>(request->arg("cycleMs").toInt()));
+        changed = true;
+    }
+
+    DynamicJsonDocument doc(256);
+    doc["ok"] = 1;
+    doc["changed"] = changed;
+    const PumpRuntimeStatus runtime = scheduler_.runtimeStatus();
+    doc["newPumpsEnabled"] = runtime.newPumpsEnabled;
+    doc["batteryThresholdPct"] = runtime.batteryFullThresholdPct;
+    doc["autonomousCycleMs"] = runtime.autonomousCycleMs;
+
+    String out;
+    serializeJson(doc, out);
+    request->send(200, "application/json", out);
+}
+
 void WebPortal::setupServerRoutes()
 {
     server_.on("/api/status", HTTP_GET, [this](AsyncWebServerRequest *r)
@@ -345,6 +389,10 @@ void WebPortal::setupServerRoutes()
                { handleRtcConfig(r); });
     server_.on("/api/rtc/config", HTTP_POST, [this](AsyncWebServerRequest *r)
                { handleRtcConfig(r); });
+    server_.on("/api/pumps/config", HTTP_GET, [this](AsyncWebServerRequest *r)
+               { handlePumpConfig(r); });
+    server_.on("/api/pumps/config", HTTP_POST, [this](AsyncWebServerRequest *r)
+               { handlePumpConfig(r); });
 
     initFileServer();
 }

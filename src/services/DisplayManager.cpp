@@ -145,6 +145,28 @@ void DisplayManager::drawPowerFlowScreen(const EpeverTracerData &epeverData, Rtc
         lcd_.drawStr(2, 63, gc::time::formatRtcBottomLine(now).c_str());
 }
 
+void DisplayManager::drawWaterPumpScreen(const PumpRuntimeStatus &status, const EpeverTracerData &epeverData, RtcService &rtc)
+{
+    lcd_.setFont(u8g2_font_5x7_tf);
+    char line[40];
+    snprintf(line, sizeof(line), "Auto: %s", status.newPumpsEnabled ? "ON" : "OFF");
+    lcd_.drawStr(2, 10, line);
+    snprintf(line, sizeof(line), "Top: %s", status.topTankFull ? "FULL" : "OPEN");
+    lcd_.drawStr(2, 20, line);
+    snprintf(line, sizeof(line), "Left: %s/%s", status.leftTankEmpty ? "EMPTY" : "OK", status.leftTankFull ? "FULL" : "OPEN");
+    lcd_.drawStr(2, 30, line);
+    snprintf(line, sizeof(line), "Right:%s/%s", status.rightTankEmpty ? "EMPTY" : "OK", status.rightTankFull ? "FULL" : "OPEN");
+    lcd_.drawStr(2, 40, line);
+    snprintf(line, sizeof(line), "Pumps:%u/%u", status.autonomousPumpMask, status.scheduledPumpMask);
+    lcd_.drawStr(2, 50, line);
+    snprintf(line, sizeof(line), "Bat:%u%%", epeverData.valid ? epeverData.batterySoc : 0);
+    lcd_.drawStr(2, 60, line);
+
+    Ds1307Time now;
+    if (rtc.readDateTime(now))
+        lcd_.drawStr(70, 60, gc::time::formatRtcBottomLine(now).c_str());
+}
+
 void DisplayManager::drawEnergyWifiScreen(bool apActive, float pvDailyWh, float pvMonthlyWh, float pvTotalWh)
 {
     char line[40];
@@ -160,13 +182,13 @@ void DisplayManager::drawEnergyWifiScreen(bool apActive, float pvDailyWh, float 
     lcd_.drawStr(2, 48, line);
 }
 
-void DisplayManager::update(bool apActive, const EpeverTracerData &epeverData, float pvDailyWh, float pvMonthlyWh, float pvTotalWh, RtcService &rtc)
+void DisplayManager::update(bool apActive, const EpeverTracerData &epeverData, const PumpRuntimeStatus &pumpRuntime, float pvDailyWh, float pvMonthlyWh, float pvTotalWh, RtcService &rtc)
 {
     unsigned long nowMs = millis();
 
     if (nowMs - lastScreenSwitchMs_ >= 10000UL)
     {
-        activeScreen_ = (activeScreen_ + 1) % 2;
+        activeScreen_ = (activeScreen_ + 1) % 3;
         lastScreenSwitchMs_ = nowMs;
     }
 
@@ -183,6 +205,8 @@ void DisplayManager::update(bool apActive, const EpeverTracerData &epeverData, f
     lcd_.clearBuffer();
     if (activeScreen_ == 0)
         drawPowerFlowScreen(epeverData, rtc);
+    else if (activeScreen_ == 1)
+        drawWaterPumpScreen(pumpRuntime, epeverData, rtc);
     else
         drawEnergyWifiScreen(apActive, pvDailyWh, pvMonthlyWh, pvTotalWh);
     lcd_.sendBuffer();

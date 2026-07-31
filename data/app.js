@@ -39,6 +39,15 @@
 
     function renderStatus(data) {
         const isValid = !!data.tracerValid;
+        const waterStates = [
+            `Auto: ${data.newPumpsEnabled ? 'ON' : 'OFF'}`,
+            `Top: ${data.topTankFull ? 'FULL' : 'OPEN'}`,
+            `Left: ${data.leftTankEmpty ? 'EMPTY' : 'OK'}/${data.leftTankFull ? 'FULL' : 'OPEN'}`,
+            `Right: ${data.rightTankEmpty ? 'EMPTY' : 'OK'}/${data.rightTankFull ? 'FULL' : 'OPEN'}`,
+            `Pumps: A=${data.autonomousPumpMask || 0} S=${data.scheduledPumpMask || 0}`,
+            `Batt: ${Number(data.batteryVoltage || 0).toFixed(2)}V / ${Number(data.batterySoc || 0)}%`
+        ].join('\n');
+        document.getElementById('waterStates').textContent = waterStates;
         if (isValid) {
             const batteryVNum = Number(data.batteryVoltage || data.batteryV || 0);
             const batteryANum = Number(data.batteryCurrent || 0);
@@ -176,8 +185,8 @@
         wrap.onclick = (e) => { if (e.target === wrap) wrap.style.display = 'none'; };
 
         const panel = el('div', { className: 'modal-panel' });
-        const title = el('h3', {}, 'RTC settings');
-        const hint = el('p', { className: 'muted' }, 'Set the DS1307 clock on the controller.');
+        const title = el('h3', {}, 'RTC and pump settings');
+        const hint = el('p', { className: 'muted' }, 'Set the DS1307 clock and the new autonomous pump logic.');
         const liveValue = el('p', { className: 'muted' }, 'RTC value: loading…');
         const form = el('div', { className: 'form' });
 
@@ -194,6 +203,31 @@
         dateRow.appendChild(yearInput);
         dateRow.appendChild(el('label', {}, ' Time: '));
         dateRow.appendChild(timeInput);
+
+        const pumpSection = el('div', { className: 'form' });
+        const pumpEnabledRow = el('div', { className: 'row' });
+        const pumpEnabled = el('input', { type: 'checkbox' });
+        pumpEnabledRow.appendChild(pumpEnabled);
+        pumpEnabledRow.appendChild(el('label', {}, 'Enable new autonomous pumps'));
+
+        const thresholdRow = el('div', { className: 'row' });
+        const thresholdInput = el('input', { type: 'number', min: 0, max: 100, value: 80 });
+        thresholdRow.appendChild(el('label', {}, 'Battery threshold %: '));
+        thresholdRow.appendChild(thresholdInput);
+
+        const cycleRow = el('div', { className: 'row' });
+        const cycleInput = el('input', { type: 'number', min: 10000, step: 1000, value: 60000 });
+        cycleRow.appendChild(el('label', {}, 'Cycle time ms: '));
+        cycleRow.appendChild(cycleInput);
+
+        const pumpSave = el('button', {}, 'Save pump settings');
+        pumpSave.onclick = () => {
+            const params = new URLSearchParams();
+            params.set('enabled', pumpEnabled.checked ? '1' : '0');
+            params.set('threshold', String(parseInt(thresholdInput.value, 10) || 80));
+            params.set('cycleMs', String(parseInt(cycleInput.value, 10) || 60000));
+            fetch('/api/pumps/config', { method: 'POST', body: params }).then(() => reload()).catch(() => alert('Unable to save pump settings.'));
+        };
 
         const actions = el('div', { className: 'row' });
         const save = el('button', {}, 'Save time');
@@ -251,10 +285,15 @@
 
         form.appendChild(dateRow);
         form.appendChild(actions);
+        pumpSection.appendChild(pumpEnabledRow);
+        pumpSection.appendChild(thresholdRow);
+        pumpSection.appendChild(cycleRow);
+        pumpSection.appendChild(pumpSave);
         panel.appendChild(title);
         panel.appendChild(hint);
         panel.appendChild(liveValue);
         panel.appendChild(form);
+        panel.appendChild(pumpSection);
         wrap.appendChild(panel);
     }
 

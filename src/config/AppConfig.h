@@ -13,6 +13,13 @@ static constexpr uint32_t kApTimeoutMs = 15UL * 60UL * 1000UL;
 static constexpr int kRestartApButtonPin = 0;
 static constexpr int kPump1Pin = 37;
 static constexpr int kPump2Pin = 38;
+static constexpr int kTopTankFullPin = -1;
+static constexpr int kLeftTankEmptyPin = -1;
+static constexpr int kLeftTankFullPin = -1;
+static constexpr int kRightTankEmptyPin = -1;
+static constexpr int kRightTankFullPin = -1;
+static constexpr uint8_t kAutonomousPumpBatteryThresholdPct = 80;
+static constexpr uint32_t kAutonomousPumpCycleMs = 60000UL;
 
 static constexpr int kI2cSdaPin = 8;
 static constexpr int kI2cSclPin = 9;
