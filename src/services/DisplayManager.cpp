@@ -137,8 +137,8 @@ void DisplayManager::drawPowerFlowScreen(const EpeverTracerData &epeverData, Rtc
         snprintf(line, sizeof(line), "xx.xxW");
     lcd_.drawStr(92, 38, line);
 
-    drawFlowChevrons(28, 10, epeverData.valid && epeverData.pvPowerWatts > 0.2f);
-    drawFlowChevrons(74, 10, epeverData.valid && epeverData.loadPowerWatts > 0.2f);
+    drawFlowChevrons(28, 8, epeverData.valid && epeverData.pvPowerWatts > 0.2f);
+    drawFlowChevrons(74, 8, epeverData.valid && epeverData.loadPowerWatts > 0.2f);
 
     Ds1307Time now;
     if (rtc.readDateTime(now))
