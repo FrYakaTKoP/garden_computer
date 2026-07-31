@@ -6,7 +6,7 @@ namespace gc::config
 {
 static constexpr const char *kApName = "tuttli-9000";
 static constexpr const char *kApPassword = "";
-static constexpr IPAddress kApIp(192, 168, 4, 1);
+static const IPAddress kApIp(192, 168, 4, 1);
 static constexpr uint8_t kDnsPort = 53;
 static constexpr uint32_t kApTimeoutMs = 15UL * 60UL * 1000UL;
 
