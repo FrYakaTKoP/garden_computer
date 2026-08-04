@@ -20,10 +20,6 @@ void DisplayManager::begin()
     lcd_.begin();
     lcd_.setContrast(180);
     lcd_.clearBuffer();
-    lcd_.setFont(u8g2_font_6x12_tf);
-    lcd_.drawStr(2, 14, "Garden Computer");
-    lcd_.setFont(u8g2_font_5x7_tf);
-    lcd_.drawStr(2, 30, "Reprap 12864 ready");
     lcd_.sendBuffer();
 
     lastScreenSwitchMs_ = millis();
@@ -70,12 +66,18 @@ void DisplayManager::drawFlowChevrons(int16_t x, int16_t y, bool enabled)
 
 void DisplayManager::drawPowerFlowScreen(const EpeverTracerData &epeverData, RtcService &rtc)
 {
-    lcd_.setFont(u8g2_font_5x7_tf);
+    lcd_.setFont(u8g2_font_timR08_tf);
+    auto drawLabel = [&](int16_t x, int16_t y, const char *text)
+    {
+        lcd_.setFont(u8g2_font_timB08_tf);
+        lcd_.drawStr(x, y, text);
+        lcd_.setFont(u8g2_font_timR08_tf);
+    };
 
     char line[28];
-    lcd_.drawStr(2, 8, "PV");
+    drawLabel(2, 8, "PV");
     drawBatteryIcon(47, 10, batterySocForIcon(epeverData.valid ? epeverData.batterySoc : 0));
-    lcd_.drawStr(92, 8, "LOAD");
+    drawLabel(92, 8, "LOAD");
 
     if (epeverData.valid)
         snprintf(line, sizeof(line), "%.2fV", epeverData.pvVoltage);
@@ -114,9 +116,9 @@ void DisplayManager::drawPowerFlowScreen(const EpeverTracerData &epeverData, Rtc
     lcd_.drawStr(47, 38, line);
 
     if (epeverData.valid)
-        snprintf(line, sizeof(line), "%.2fC", epeverData.batteryTemperatureC);
+        snprintf(line, sizeof(line), "%.2f\xB0" "C", epeverData.batteryTemperatureC);
     else
-        snprintf(line, sizeof(line), "xx.xxC");
+        snprintf(line, sizeof(line), "xx.xx\xB0" "C");
     lcd_.drawStr(47, 48, line);
 
     if (epeverData.valid)
@@ -143,50 +145,90 @@ void DisplayManager::drawPowerFlowScreen(const EpeverTracerData &epeverData, Rtc
     Ds1307Time now;
     if (rtc.readDateTime(now))
         lcd_.drawStr(2, 63, gc::time::formatRtcBottomLine(now).c_str());
+    else
+        lcd_.drawStr(2, 63, "RTC unavailable");
 }
 
 void DisplayManager::drawWaterPumpScreen(const PumpRuntimeStatus &status, const EpeverTracerData &epeverData, RtcService &rtc)
 {
-    lcd_.setFont(u8g2_font_5x7_tf);
-    char line[40];
-    snprintf(line, sizeof(line), "Auto: %s", status.newPumpsEnabled ? "ON" : "OFF");
-    lcd_.drawStr(2, 10, line);
-    snprintf(line, sizeof(line), "Top: %s", status.topTankFull ? "FULL" : "OPEN");
-    lcd_.drawStr(2, 20, line);
-    snprintf(line, sizeof(line), "Left: %s/%s", status.leftTankEmpty ? "EMPTY" : "OK", status.leftTankFull ? "FULL" : "OPEN");
-    lcd_.drawStr(2, 30, line);
-    snprintf(line, sizeof(line), "Right:%s/%s", status.rightTankEmpty ? "EMPTY" : "OK", status.rightTankFull ? "FULL" : "OPEN");
-    lcd_.drawStr(2, 40, line);
-    snprintf(line, sizeof(line), "Pumps:%u/%u", status.autonomousPumpMask, status.scheduledPumpMask);
-    lcd_.drawStr(2, 50, line);
-    snprintf(line, sizeof(line), "Bat:%u%%", epeverData.valid ? epeverData.batterySoc : 0);
-    lcd_.drawStr(2, 60, line);
+    lcd_.setFont(u8g2_font_4x6_tf);
+    auto drawLabel = [&](int16_t x, int16_t y, const char *text)
+    {
+        lcd_.setFont(u8g2_font_4x6_mf);
+        lcd_.drawStr(x, y, text);
+        lcd_.setFont(u8g2_font_4x6_tf);
+    };
+    auto drawLabelValue = [&](int16_t x, int16_t y, const char *label, const char *value)
+    {
+        lcd_.setFont(u8g2_font_4x6_mf);
+        lcd_.drawStr(x, y, label);
+        int16_t labelWidth = lcd_.getStrWidth(label);
+        lcd_.setFont(u8g2_font_4x6_tf);
+        lcd_.drawStr(x + labelWidth + 1, y, value);
+    };
 
-    Ds1307Time now;
-    if (rtc.readDateTime(now))
-        lcd_.drawStr(70, 60, gc::time::formatRtcBottomLine(now).c_str());
+    auto nextLabel = [&](bool fillEnabled, const String &nextValue) -> const char *
+    {
+        if (!fillEnabled)
+            return "DISABLED";
+        if (nextValue.length() == 0 || nextValue == "--")
+            return "NO SCHEDULE";
+        return nextValue.c_str();
+    };
+
+    auto drawTankBox = [&](int16_t x, int16_t y, int16_t w, int16_t h, const char *title, const char *stateValue, const char *fillValue, const char *waterValue, const char *nextValue, int16_t textXOffset, int16_t textYOffset)
+    {
+        lcd_.drawFrame(x, y, w, h);
+        drawLabel(x + textXOffset, y + 7 + textYOffset, title);
+        drawLabelValue(x + textXOffset, y + 15 + textYOffset, "W.-level:", stateValue);
+        if (fillValue && fillValue[0] != '\0')
+            drawLabelValue(x + textXOffset, y + 24 + textYOffset, "Fill:", fillValue);
+        if (waterValue && waterValue[0] != '\0')
+            drawLabelValue(x + textXOffset, y + 32 + textYOffset, "Water:", waterValue);
+        if (nextValue && nextValue[0] != '\0')
+            drawLabelValue(x + textXOffset, y + 40 + textYOffset, "Next:", nextValue);
+    };
+
+    drawTankBox(0, 0, 128, 17, "TOP TANK", status.topTankFull ? "FULL" : "OK", "", "", "", 2, 0);
+
+    const char *leftFillValue = status.fillPump1Active ? "ON" : "OFF";
+    const char *leftWaterValue = status.wateringPump1Enabled ? (status.wateringPump1Active ? "ON" : "OFF") : "DISABLED";
+    const char *leftNextValue = nextLabel(status.fillPump1Enabled, status.nextFillPump1);
+    drawTankBox(0, 16, 64, 46, "LEFT TANK", status.leftTankEmpty ? "EMPTY" : "OK", leftFillValue, leftWaterValue, leftNextValue, 3, 1);
+
+    const char *rightFillValue = status.fillPump2Active ? "ON" : "OFF";
+    const char *rightWaterValue = status.wateringPump2Enabled ? (status.wateringPump2Active ? "ON" : "OFF") : "DISABLED";
+    const char *rightNextValue = nextLabel(status.fillPump2Enabled, status.nextFillPump2);
+    drawTankBox(63, 16, 64, 46, "RIGHT TANK", status.rightTankEmpty ? "EMPTY" : "OK", rightFillValue, rightWaterValue, rightNextValue, 3, 1);
 }
 
 void DisplayManager::drawEnergyWifiScreen(bool apActive, float pvDailyWh, float pvMonthlyWh, float pvTotalWh)
 {
-    char line[40];
-    lcd_.setFont(u8g2_font_5x7_tf);
-    snprintf(line, sizeof(line), "Day:     %.2f kWh", pvDailyWh / 1000.0f);
-    lcd_.drawStr(2, 12, line);
-    snprintf(line, sizeof(line), "Month:   %.2f kWh", pvMonthlyWh / 1000.0f);
-    lcd_.drawStr(2, 24, line);
-    snprintf(line, sizeof(line), "Total:   %.2f kWh", pvTotalWh / 1000.0f);
-    lcd_.drawStr(2, 36, line);
+    char value[24];
+    lcd_.setFont(u8g2_font_timR08_tf);
+    auto drawLabelValue = [&](int16_t x, int16_t y, const char *label, const char *val)
+    {
+        lcd_.setFont(u8g2_font_timB08_tf);
+        lcd_.drawStr(x, y, label);
+        int16_t labelWidth = lcd_.getStrWidth(label);
+        lcd_.setFont(u8g2_font_timR08_tf);
+        lcd_.drawStr(x + labelWidth + 1, y, val);
+    };
 
-    snprintf(line, sizeof(line), "WiFi AP: %s", apActive ? "ON" : "OFF");
-    lcd_.drawStr(2, 48, line);
+    snprintf(value, sizeof(value), "%.2f kWh", pvDailyWh / 1000.0f);
+    drawLabelValue(2, 12, "Day:", value);
+    snprintf(value, sizeof(value), "%.2f kWh", pvMonthlyWh / 1000.0f);
+    drawLabelValue(2, 24, "Month:", value);
+    snprintf(value, sizeof(value), "%.2f kWh", pvTotalWh / 1000.0f);
+    drawLabelValue(2, 36, "Total:", value);
+    drawLabelValue(2, 48, "WiFi AP:", apActive ? "ON" : "OFF");
 }
 
 void DisplayManager::update(bool apActive, const EpeverTracerData &epeverData, const PumpRuntimeStatus &pumpRuntime, float pvDailyWh, float pvMonthlyWh, float pvTotalWh, RtcService &rtc)
 {
     unsigned long nowMs = millis();
 
-    if (nowMs - lastScreenSwitchMs_ >= 10000UL)
+    if (nowMs - lastScreenSwitchMs_ >= 5000UL)
     {
         activeScreen_ = (activeScreen_ + 1) % 3;
         lastScreenSwitchMs_ = nowMs;
@@ -206,9 +248,9 @@ void DisplayManager::update(bool apActive, const EpeverTracerData &epeverData, c
     if (activeScreen_ == 0)
         drawPowerFlowScreen(epeverData, rtc);
     else if (activeScreen_ == 1)
-        drawWaterPumpScreen(pumpRuntime, epeverData, rtc);
-    else
         drawEnergyWifiScreen(apActive, pvDailyWh, pvMonthlyWh, pvTotalWh);
+    else
+        drawWaterPumpScreen(pumpRuntime, epeverData, rtc);
     lcd_.sendBuffer();
 }
 }

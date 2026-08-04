@@ -1,14 +1,88 @@
 #include "services/PumpScheduler.h"
 
+#include <math.h>
+
+#include "config/AppConfig.h"
 #include "core/TimeUtils.h"
 #include "services/RtcService.h"
 
+namespace
+{
+struct SchedulerClock
+{
+    uint32_t dayIndex = 0;
+    uint8_t weekdayIndex = 0;
+    uint32_t secondsOfDay = 0;
+};
+
+bool readSchedulerClock(gc::RtcService &rtc, SchedulerClock &clock)
+{
+    gc::Ds1307Time now;
+    if (rtc.readDateTime(now))
+    {
+        clock.dayIndex = gc::time::daysSince2000(now.year, now.month, now.day);
+        clock.weekdayIndex = gc::time::dayOfWeekFromDate(now.year, now.month, now.day);
+        clock.secondsOfDay = static_cast<uint32_t>(now.hour) * 3600UL + static_cast<uint32_t>(now.minute) * 60UL + now.second;
+        return true;
+    }
+
+    uint8_t hour = 0;
+    uint8_t minute = 0;
+    uint8_t weekday = 0;
+    uint32_t dayIndex = 0;
+    String display;
+    if (rtc.present() && rtc.readClock(hour, minute, weekday, dayIndex, display))
+    {
+        clock.dayIndex = dayIndex;
+        clock.weekdayIndex = weekday;
+        clock.secondsOfDay = static_cast<uint32_t>(hour) * 3600UL + static_cast<uint32_t>(minute) * 60UL;
+        return true;
+    }
+
+    unsigned long uptimeSeconds = millis() / 1000UL;
+    clock.dayIndex = uptimeSeconds / 86400UL;
+    clock.weekdayIndex = static_cast<uint8_t>((uptimeSeconds / 86400UL) % 7UL);
+    clock.secondsOfDay = uptimeSeconds % 86400UL;
+    return false;
+}
+
+String formatCountdownLabel(uint32_t seconds)
+{
+    if (seconds >= 3600UL)
+    {
+        uint32_t hours = seconds / 3600UL;
+        return String(hours) + "h";
+    }
+    if (seconds >= 60UL)
+    {
+        uint32_t minutes = seconds / 60UL;
+        return String(minutes) + "m";
+    }
+    if (seconds == 0)
+        return "now";
+    return String(seconds) + "s";
+}
+}
+
 namespace gc
 {
-PumpScheduler::PumpScheduler(Preferences &prefs, int pump1Pin, int pump2Pin, int topTankFullPin, int leftTankEmptyPin, int leftTankFullPin, int rightTankEmptyPin, int rightTankFullPin, uint8_t maxSchedules, uint8_t maxActiveRuns)
+PumpScheduler::PumpScheduler(Preferences &prefs,
+                     int leftTankFillPumpPin,
+                     int rightTankFillPumpPin,
+                     int leftTankWateringPumpPin,
+                     int rightTankWateringPumpPin,
+                     int topTankFullPin,
+                     int leftTankEmptyPin,
+                     int leftTankFullPin,
+                     int rightTankEmptyPin,
+                     int rightTankFullPin,
+                     uint8_t maxSchedules,
+                     uint8_t maxActiveRuns)
     : prefs_(prefs),
-      pump1Pin_(pump1Pin),
-      pump2Pin_(pump2Pin),
+    leftTankFillPumpPin_(leftTankFillPumpPin),
+    rightTankFillPumpPin_(rightTankFillPumpPin),
+    leftTankWateringPumpPin_(leftTankWateringPumpPin),
+    rightTankWateringPumpPin_(rightTankWateringPumpPin),
       topTankFullPin_(topTankFullPin),
       leftTankEmptyPin_(leftTankEmptyPin),
       leftTankFullPin_(leftTankFullPin),
@@ -18,9 +92,12 @@ PumpScheduler::PumpScheduler(Preferences &prefs, int pump1Pin, int pump2Pin, int
       maxActiveRuns_(maxActiveRuns),
       scheduleCount_(0),
       nextId_(1),
-      newPumpsEnabled_(false),
-      batteryThresholdPct_(80),
-      autonomousCycleMs_(60000UL),
+    fillPump1Enabled_(true),
+    fillPump2Enabled_(true),
+    wateringPump1Enabled_(false),
+    wateringPump2Enabled_(false),
+    pvVoltageThresholdV_(config::kAutonomousPumpPvVoltageThresholdV),
+    autonomousCycleMs_(config::kAutonomousPumpCycleMs),
       topTankFull_(false),
       leftTankEmpty_(false),
       leftTankFull_(false),
@@ -139,10 +216,26 @@ int PumpScheduler::findScheduleIndex(uint32_t id) const
 
 void PumpScheduler::setPumpPins()
 {
-    pinMode(pump1Pin_, OUTPUT);
-    pinMode(pump2Pin_, OUTPUT);
-    digitalWrite(pump1Pin_, LOW);
-    digitalWrite(pump2Pin_, LOW);
+    if (leftTankFillPumpPin_ >= 0)
+    {
+        pinMode(leftTankFillPumpPin_, OUTPUT);
+        digitalWrite(leftTankFillPumpPin_, LOW);
+    }
+    if (rightTankFillPumpPin_ >= 0)
+    {
+        pinMode(rightTankFillPumpPin_, OUTPUT);
+        digitalWrite(rightTankFillPumpPin_, LOW);
+    }
+    if (leftTankWateringPumpPin_ >= 0)
+    {
+        pinMode(leftTankWateringPumpPin_, OUTPUT);
+        digitalWrite(leftTankWateringPumpPin_, LOW);
+    }
+    if (rightTankWateringPumpPin_ >= 0)
+    {
+        pinMode(rightTankWateringPumpPin_, OUTPUT);
+        digitalWrite(rightTankWateringPumpPin_, LOW);
+    }
 
     if (topTankFullPin_ >= 0) pinMode(topTankFullPin_, INPUT_PULLUP);
     if (leftTankEmptyPin_ >= 0) pinMode(leftTankEmptyPin_, INPUT_PULLUP);
@@ -153,18 +246,78 @@ void PumpScheduler::setPumpPins()
 
 uint8_t PumpScheduler::activePumpMask() const
 {
-    uint8_t combined = autonomousPumpMask_;
+    return fillActivePumpMask() | wateringActivePumpMask();
+}
+
+uint8_t PumpScheduler::fillActivePumpMask() const
+{
+    uint8_t combined = 0;
     for (uint8_t i = 0; i < maxActiveRuns_; i++)
         if (activeRuns_[i].active)
             combined |= activeRuns_[i].pumpMask;
     return combined;
 }
 
-PumpRuntimeStatus PumpScheduler::runtimeStatus() const
+uint8_t PumpScheduler::wateringActivePumpMask() const
+{
+    return autonomousPumpMask_;
+}
+
+String PumpScheduler::nextScheduleLabel(uint8_t pumpMask, RtcService &rtc) const
+{
+    SchedulerClock clock;
+    readSchedulerClock(rtc, clock);
+
+    uint32_t bestDeltaSeconds = 0xFFFFFFFFUL;
+    bool found = false;
+
+    for (uint8_t i = 0; i < scheduleCount_; i++)
+    {
+        const Schedule &s = schedules_[i];
+        if ((s.pumpMask & pumpMask) == 0)
+            continue;
+
+        const uint32_t scheduleSeconds = static_cast<uint32_t>(s.hour) * 3600UL + static_cast<uint32_t>(s.minute) * 60UL;
+        for (uint16_t offsetDays = 0; offsetDays <= 366; offsetDays++)
+        {
+            const uint32_t candidateDayIndex = clock.dayIndex + offsetDays;
+            const uint8_t candidateWeekday = static_cast<uint8_t>((clock.weekdayIndex + offsetDays) % 7U);
+            if (!scheduleMatchesToday(s, candidateWeekday, candidateDayIndex))
+                continue;
+
+            if (offsetDays == 0 && scheduleSeconds <= clock.secondsOfDay)
+                continue;
+
+            const uint32_t deltaSeconds = (offsetDays * 86400UL) + scheduleSeconds - clock.secondsOfDay;
+            if (!found || deltaSeconds < bestDeltaSeconds)
+            {
+                bestDeltaSeconds = deltaSeconds;
+                found = true;
+            }
+            break;
+        }
+    }
+
+    if (!found)
+        return String("--");
+
+    return formatCountdownLabel(bestDeltaSeconds);
+}
+
+PumpRuntimeStatus PumpScheduler::runtimeStatus(RtcService &rtc) const
 {
     PumpRuntimeStatus status;
-    status.newPumpsEnabled = newPumpsEnabled_;
-    status.batteryFullThresholdPct = batteryThresholdPct_;
+    status.fillPump1Enabled = fillPump1Enabled_;
+    status.fillPump2Enabled = fillPump2Enabled_;
+    status.wateringPump1Enabled = wateringPump1Enabled_;
+    status.wateringPump2Enabled = wateringPump2Enabled_;
+    const uint8_t fillMask = fillActivePumpMask();
+    const uint8_t wateringMask = wateringActivePumpMask();
+    status.fillPump1Active = (fillMask & 1) != 0;
+    status.fillPump2Active = (fillMask & 2) != 0;
+    status.wateringPump1Active = (wateringMask & 1) != 0;
+    status.wateringPump2Active = (wateringMask & 2) != 0;
+    status.pvVoltageThresholdV = pvVoltageThresholdV_;
     status.autonomousCycleMs = autonomousCycleMs_;
     status.topTankFull = topTankFull_;
     status.leftTankEmpty = leftTankEmpty_;
@@ -172,24 +325,53 @@ PumpRuntimeStatus PumpScheduler::runtimeStatus() const
     status.rightTankEmpty = rightTankEmpty_;
     status.rightTankFull = rightTankFull_;
     status.autonomousPumpMask = autonomousPumpMask_;
-    status.scheduledPumpMask = scheduledPumpMask_;
+    status.scheduledPumpMask = fillMask;
+    status.nextFillPump1 = nextScheduleLabel(1, rtc);
+    status.nextFillPump2 = nextScheduleLabel(2, rtc);
     return status;
 }
 
-bool PumpScheduler::setNewPumpsEnabled(bool enabled)
+bool PumpScheduler::setFillPump1Enabled(bool enabled)
 {
-    if (newPumpsEnabled_ == enabled)
+    if (fillPump1Enabled_ == enabled)
         return true;
-    newPumpsEnabled_ = enabled;
+    fillPump1Enabled_ = enabled;
     saveSettings();
     return true;
 }
 
-bool PumpScheduler::setBatteryThresholdPct(uint8_t value)
+bool PumpScheduler::setFillPump2Enabled(bool enabled)
 {
-    if (value > 100)
+    if (fillPump2Enabled_ == enabled)
+        return true;
+    fillPump2Enabled_ = enabled;
+    saveSettings();
+    return true;
+}
+
+bool PumpScheduler::setWateringPump1Enabled(bool enabled)
+{
+    if (wateringPump1Enabled_ == enabled)
+        return true;
+    wateringPump1Enabled_ = enabled;
+    saveSettings();
+    return true;
+}
+
+bool PumpScheduler::setWateringPump2Enabled(bool enabled)
+{
+    if (wateringPump2Enabled_ == enabled)
+        return true;
+    wateringPump2Enabled_ = enabled;
+    saveSettings();
+    return true;
+}
+
+bool PumpScheduler::setPvVoltageThresholdV(float value)
+{
+    if (value < 0.0f || value > 100.0f)
         return false;
-    batteryThresholdPct_ = value;
+    pvVoltageThresholdV_ = value;
     saveSettings();
     return true;
 }
@@ -205,9 +387,17 @@ bool PumpScheduler::setAutonomousCycleMs(uint32_t value)
 
 void PumpScheduler::updateOutputs()
 {
-    const uint8_t combined = activePumpMask();
-    digitalWrite(pump1Pin_, (combined & 1) ? HIGH : LOW);
-    digitalWrite(pump2Pin_, (combined & 2) ? HIGH : LOW);
+    const uint8_t fillMask = fillActivePumpMask();
+    const uint8_t wateringMask = wateringActivePumpMask();
+
+    if (leftTankFillPumpPin_ >= 0)
+        digitalWrite(leftTankFillPumpPin_, (fillMask & 1) ? HIGH : LOW);
+    if (rightTankFillPumpPin_ >= 0)
+        digitalWrite(rightTankFillPumpPin_, (fillMask & 2) ? HIGH : LOW);
+    if (leftTankWateringPumpPin_ >= 0)
+        digitalWrite(leftTankWateringPumpPin_, (wateringMask & 1) ? HIGH : LOW);
+    if (rightTankWateringPumpPin_ >= 0)
+        digitalWrite(rightTankWateringPumpPin_, (wateringMask & 2) ? HIGH : LOW);
 }
 
 void PumpScheduler::setAutonomousPumpOutput(bool on, uint8_t pumpMask)
@@ -248,8 +438,9 @@ void PumpScheduler::updateAutonomousLogic(const EpeverTracerData &epeverData)
     const bool leftFull = leftTankFull_;
     const bool rightEmpty = rightTankEmpty_;
     const bool rightFull = rightTankFull_;
+    const uint8_t enabledMask = (wateringPump1Enabled_ ? 1 : 0) | (wateringPump2Enabled_ ? 2 : 0);
 
-    if (!newPumpsEnabled_)
+    if (enabledMask == 0)
     {
         setAutonomousPumpOutput(false, 0);
         return;
@@ -261,20 +452,26 @@ void PumpScheduler::updateAutonomousLogic(const EpeverTracerData &epeverData)
         return;
     }
 
-    const uint8_t activeMask = activePumpMask();
-    scheduledPumpMask_ = activeMask & 0x03;
-    if ((activeMask & 1) || (activeMask & 2))
+    const uint8_t fillMask = fillActivePumpMask();
+    const uint8_t wateringMask = wateringActivePumpMask();
+    scheduledPumpMask_ = fillMask;
+    if ((fillMask & 0x03) || (wateringMask & 0x03))
         return;
 
-    const bool batteryFull = epeverData.valid && epeverData.batterySoc >= batteryThresholdPct_;
-    if (!batteryFull)
+    const bool batteryCurrentIdle = epeverData.valid && fabsf(epeverData.batteryCurrent) <= 0.05f;
+    const bool pvVoltageReady = epeverData.valid && epeverData.pvVoltage >= pvVoltageThresholdV_;
+    if (!(batteryCurrentIdle && pvVoltageReady))
     {
         setAutonomousPumpOutput(false, 0);
         return;
     }
 
     const bool usePump1 = (autonomousPumpIndex_ % 2) == 0;
-    const bool shouldRun = !topFull && (usePump1 ? leftEmpty && !leftFull : rightEmpty && !rightFull);
+    uint8_t desiredPumpMask = usePump1 ? 1 : 2;
+    if ((enabledMask & desiredPumpMask) == 0)
+        desiredPumpMask = (enabledMask & 1) ? 1 : 2;
+
+    const bool shouldRun = !topFull && (desiredPumpMask == 1 ? leftEmpty && !leftFull : rightEmpty && !rightFull);
     if (!shouldRun)
     {
         setAutonomousPumpOutput(false, 0);
@@ -287,7 +484,7 @@ void PumpScheduler::updateAutonomousLogic(const EpeverTracerData &epeverData)
         autonomousPumpIndex_ = (autonomousPumpIndex_ + 1) % 2;
     }
 
-    setAutonomousPumpOutput(true, usePump1 ? 1 : 2);
+    setAutonomousPumpOutput(true, desiredPumpMask);
 }
 
 void PumpScheduler::activatePumpMask(uint8_t mask, uint32_t durationMs, uint32_t schedId)
@@ -373,24 +570,39 @@ void PumpScheduler::checkSchedules(RtcService &rtc)
         Schedule &s = schedules_[i];
         if (s.hour == hour && s.minute == minute && scheduleMatchesToday(s, weekday, dayIndex))
         {
+            const uint8_t fillEnabledMask = (fillPump1Enabled_ ? 1 : 0) | (fillPump2Enabled_ ? 2 : 0);
+            const uint8_t effectiveMask = s.pumpMask & fillEnabledMask;
+            if (effectiveMask == 0)
+                continue;
             uint32_t durationMs = static_cast<uint32_t>(s.duration5min) * 5UL * 60UL * 1000UL;
-            activatePumpMask(s.pumpMask, durationMs, s.id);
-            Serial.printf("Trigger schedule %u pumpMask %u for %ums\n", s.id, s.pumpMask, static_cast<unsigned>(durationMs));
+            activatePumpMask(effectiveMask, durationMs, s.id);
+            Serial.printf("Trigger schedule %u pumpMask %u for %ums\n", s.id, effectiveMask, static_cast<unsigned>(durationMs));
         }
     }
 }
 
 void PumpScheduler::loadSettings()
 {
-    newPumpsEnabled_ = prefs_.getBool("newPumpsEnabled", false);
-    batteryThresholdPct_ = prefs_.getUChar("batteryThresholdPct", 80);
-    autonomousCycleMs_ = prefs_.getULong("autonomousCycleMs", 60000UL);
+    const bool legacyEnabled = prefs_.getBool("newPumpsEnabled", false);
+    const bool hasFillPump1 = prefs_.isKey("fillPump1Enabled");
+    const bool hasFillPump2 = prefs_.isKey("fillPump2Enabled");
+    const bool hasPump1 = prefs_.isKey("wateringPump1Enabled");
+    const bool hasPump2 = prefs_.isKey("wateringPump2Enabled");
+    fillPump1Enabled_ = hasFillPump1 ? prefs_.getBool("fillPump1Enabled", true) : true;
+    fillPump2Enabled_ = hasFillPump2 ? prefs_.getBool("fillPump2Enabled", true) : true;
+    wateringPump1Enabled_ = hasPump1 ? prefs_.getBool("wateringPump1Enabled", false) : legacyEnabled;
+    wateringPump2Enabled_ = hasPump2 ? prefs_.getBool("wateringPump2Enabled", false) : legacyEnabled;
+    pvVoltageThresholdV_ = prefs_.getFloat("pvVoltageThresholdV", config::kAutonomousPumpPvVoltageThresholdV);
+    autonomousCycleMs_ = prefs_.getULong("autonomousCycleMs", config::kAutonomousPumpCycleMs);
 }
 
 void PumpScheduler::saveSettings()
 {
-    prefs_.putBool("newPumpsEnabled", newPumpsEnabled_);
-    prefs_.putUChar("batteryThresholdPct", batteryThresholdPct_);
+    prefs_.putBool("fillPump1Enabled", fillPump1Enabled_);
+    prefs_.putBool("fillPump2Enabled", fillPump2Enabled_);
+    prefs_.putBool("wateringPump1Enabled", wateringPump1Enabled_);
+    prefs_.putBool("wateringPump2Enabled", wateringPump2Enabled_);
+    prefs_.putFloat("pvVoltageThresholdV", pvVoltageThresholdV_);
     prefs_.putULong("autonomousCycleMs", autonomousCycleMs_);
 }
 

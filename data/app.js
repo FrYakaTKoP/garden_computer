@@ -37,17 +37,52 @@
         return `${value.toFixed(2)}${unit}`;
     }
 
+    function tankBox(title, state, lines, extraClass = '') {
+        const box = el('div', { className: `tank-box ${extraClass}`.trim() });
+        box.appendChild(el('div', { className: 'tank-title' }, title));
+        box.appendChild(el('div', { className: 'tank-state' }, state));
+        lines.forEach(line => box.appendChild(el('div', { className: 'tank-detail' }, line)));
+        return box;
+    }
+
+    function nextScheduleLabel(fillEnabled, rawNext) {
+        if (!fillEnabled) return 'DISABLED';
+        if (!rawNext || rawNext === '--') return 'NO SCHEDULE';
+        return rawNext;
+    }
+
+    function renderWaterStates(data) {
+        const wrap = document.getElementById('waterStates');
+        wrap.innerHTML = '';
+
+        const topState = data.topTankFull ? 'FULL' : 'OK';
+        const topNext1 = data.nextFillPump1 || '--';
+        const topNext2 = data.nextFillPump2 || '--';
+        const leftFillEnabled = !!data.fillPump1Enabled;
+        const rightFillEnabled = !!data.fillPump2Enabled;
+        const leftWateringEnabled = !!data.wateringPump1Enabled;
+        const rightWateringEnabled = !!data.wateringPump2Enabled;
+
+        wrap.appendChild(tankBox('TOP TANK', topState, [
+            `W.-level: ${topState}`
+        ], 'top'));
+
+        wrap.appendChild(tankBox('LEFT TANK', data.leftTankEmpty ? 'EMPTY' : 'OK', [
+            `Fill pump (left): ${leftFillEnabled ? (data.fillPump1Active ? 'ON' : 'OFF') : 'DISABLED'} | W.-level: ${data.leftTankEmpty ? 'EMPTY' : 'OK'}`,
+            `Watering pump (left): ${leftWateringEnabled ? (data.wateringPump1Active ? 'ON' : 'OFF') : 'DISABLED'}`,
+            `Next schedule: ${nextScheduleLabel(leftFillEnabled, topNext1)}`
+        ]));
+
+        wrap.appendChild(tankBox('RIGHT TANK', data.rightTankEmpty ? 'EMPTY' : 'OK', [
+            `Fill pump (right): ${rightFillEnabled ? (data.fillPump2Active ? 'ON' : 'OFF') : 'DISABLED'} | W.-level: ${data.rightTankEmpty ? 'EMPTY' : 'OK'}`,
+            `Watering pump (right): ${rightWateringEnabled ? (data.wateringPump2Active ? 'ON' : 'OFF') : 'DISABLED'}`,
+            `Next schedule: ${nextScheduleLabel(rightFillEnabled, topNext2)}`
+        ]));
+    }
+
     function renderStatus(data) {
         const isValid = !!data.tracerValid;
-        const waterStates = [
-            `Auto: ${data.newPumpsEnabled ? 'ON' : 'OFF'}`,
-            `Top: ${data.topTankFull ? 'FULL' : 'OPEN'}`,
-            `Left: ${data.leftTankEmpty ? 'EMPTY' : 'OK'}/${data.leftTankFull ? 'FULL' : 'OPEN'}`,
-            `Right: ${data.rightTankEmpty ? 'EMPTY' : 'OK'}/${data.rightTankFull ? 'FULL' : 'OPEN'}`,
-            `Pumps: A=${data.autonomousPumpMask || 0} S=${data.scheduledPumpMask || 0}`,
-            `Batt: ${Number(data.batteryVoltage || 0).toFixed(2)}V / ${Number(data.batterySoc || 0)}%`
-        ].join('\n');
-        document.getElementById('waterStates').textContent = waterStates;
+        renderWaterStates(data);
         if (isValid) {
             const batteryVNum = Number(data.batteryVoltage || data.batteryV || 0);
             const batteryANum = Number(data.batteryCurrent || 0);
@@ -129,6 +164,7 @@
             setFlowValue('loadCurrent', 'xx.xxA');
             setFlowValue('loadPower', 'xx.xxW');
             document.getElementById('production').textContent = 'Day:   xx.xx kWh\nMonth: xx.xx kWh\nTotal:  xx.xx kWh';
+            renderWaterStates({});
         });
 
         api('/api/schedules').then(data => {
@@ -146,7 +182,7 @@
                 el('th', { className: 'time' }, 'Time'),
                 el('th', { className: 'dur' }, 'Duration'),
                 el('th', { className: 'days' }, 'Days'),
-                el('th', { className: 'pump' }, 'Pump'),
+                el('th', { className: 'pump' }, 'Top fill pump'),
                 el('th', { className: 'actions' }, 'Actions')
             ));
             const tbody = el('tbody');
@@ -156,7 +192,7 @@
                 tr.appendChild(el('td', { className: 'time', 'data-label': 'Time' }, `${String(s.hour).padStart(2, '0')}:${String(s.minute).padStart(2, '0')}`));
                 tr.appendChild(el('td', { className: 'dur', 'data-label': 'Duration' }, `${s.duration5min * 5} min`));
                 tr.appendChild(el('td', { className: 'days', 'data-label': 'Days' }, formatDays(s.weekdays)));
-                tr.appendChild(el('td', { className: 'pump', 'data-label': 'Pump' }, (s.pumpMask & 1) ? 'Pump 1' : (s.pumpMask & 2) ? 'Pump 2' : '-'));
+                tr.appendChild(el('td', { className: 'pump', 'data-label': 'Top fill pump' }, (s.pumpMask & 1) ? 'Left tank fill pump' : (s.pumpMask & 2) ? 'Right tank fill pump' : '-'));
 
                 const actions = el('td', { className: 'actions', 'data-label': 'Actions' });
                 const editBtn = el('button', {}, 'Edit');
@@ -186,7 +222,7 @@
 
         const panel = el('div', { className: 'modal-panel' });
         const title = el('h3', {}, 'RTC and pump settings');
-        const hint = el('p', { className: 'muted' }, 'Set the DS1307 clock and the new autonomous pump logic.');
+        const hint = el('p', { className: 'muted' }, 'Set the DS1307 clock and separate fill/watering pump logic per tank.');
         const liveValue = el('p', { className: 'muted' }, 'RTC value: loading…');
         const form = el('div', { className: 'form' });
 
@@ -205,14 +241,29 @@
         dateRow.appendChild(timeInput);
 
         const pumpSection = el('div', { className: 'form' });
-        const pumpEnabledRow = el('div', { className: 'row' });
-        const pumpEnabled = el('input', { type: 'checkbox' });
-        pumpEnabledRow.appendChild(pumpEnabled);
-        pumpEnabledRow.appendChild(el('label', {}, 'Enable new autonomous pumps'));
+        const fillPump1Row = el('div', { className: 'row' });
+        const fillPump1Enabled = el('input', { type: 'checkbox' });
+        fillPump1Row.appendChild(fillPump1Enabled);
+        fillPump1Row.appendChild(el('label', {}, 'Enable left tank fill pump'));
+
+        const fillPump2Row = el('div', { className: 'row' });
+        const fillPump2Enabled = el('input', { type: 'checkbox' });
+        fillPump2Row.appendChild(fillPump2Enabled);
+        fillPump2Row.appendChild(el('label', {}, 'Enable right tank fill pump'));
+
+        const pump1Row = el('div', { className: 'row' });
+        const pump1Enabled = el('input', { type: 'checkbox' });
+        pump1Row.appendChild(pump1Enabled);
+        pump1Row.appendChild(el('label', {}, 'Enable left tank watering pump'));
+
+        const pump2Row = el('div', { className: 'row' });
+        const pump2Enabled = el('input', { type: 'checkbox' });
+        pump2Row.appendChild(pump2Enabled);
+        pump2Row.appendChild(el('label', {}, 'Enable right tank watering pump'));
 
         const thresholdRow = el('div', { className: 'row' });
-        const thresholdInput = el('input', { type: 'number', min: 0, max: 100, value: 80 });
-        thresholdRow.appendChild(el('label', {}, 'Battery threshold %: '));
+        const thresholdInput = el('input', { type: 'number', min: 0, max: 100, step: 0.1, value: 20 });
+        thresholdRow.appendChild(el('label', {}, 'PV voltage threshold (V): '));
         thresholdRow.appendChild(thresholdInput);
 
         const cycleRow = el('div', { className: 'row' });
@@ -223,8 +274,11 @@
         const pumpSave = el('button', {}, 'Save pump settings');
         pumpSave.onclick = () => {
             const params = new URLSearchParams();
-            params.set('enabled', pumpEnabled.checked ? '1' : '0');
-            params.set('threshold', String(parseInt(thresholdInput.value, 10) || 80));
+            params.set('fillPump1Enabled', fillPump1Enabled.checked ? '1' : '0');
+            params.set('fillPump2Enabled', fillPump2Enabled.checked ? '1' : '0');
+            params.set('wateringPump1Enabled', pump1Enabled.checked ? '1' : '0');
+            params.set('wateringPump2Enabled', pump2Enabled.checked ? '1' : '0');
+            params.set('pvThresholdV', String(parseFloat(thresholdInput.value) || 20));
             params.set('cycleMs', String(parseInt(cycleInput.value, 10) || 60000));
             fetch('/api/pumps/config', { method: 'POST', body: params }).then(() => reload()).catch(() => alert('Unable to save pump settings.'));
         };
@@ -262,6 +316,12 @@
 
         api('/api/status').then(data => {
             liveValue.textContent = `RTC value: ${data.rtcDisplay || 'unavailable'}`;
+            fillPump1Enabled.checked = !!data.fillPump1Enabled;
+            fillPump2Enabled.checked = !!data.fillPump2Enabled;
+            pump1Enabled.checked = !!data.wateringPump1Enabled;
+            pump2Enabled.checked = !!data.wateringPump2Enabled;
+            thresholdInput.value = String(Number(data.pvVoltageThresholdV || 20));
+            cycleInput.value = String(parseInt(data.autonomousCycleMs, 10) || 60000);
             const current = splitRtcString(data.rtcDisplay || '');
             if (current) {
                 dayInput.value = String(current.day).padStart(2, '0');
@@ -285,7 +345,10 @@
 
         form.appendChild(dateRow);
         form.appendChild(actions);
-        pumpSection.appendChild(pumpEnabledRow);
+        pumpSection.appendChild(fillPump1Row);
+        pumpSection.appendChild(fillPump2Row);
+        pumpSection.appendChild(pump1Row);
+        pumpSection.appendChild(pump2Row);
         pumpSection.appendChild(thresholdRow);
         pumpSection.appendChild(cycleRow);
         pumpSection.appendChild(pumpSave);
@@ -345,13 +408,11 @@
         const pump2 = el('input', { type: 'radio', name: 'pump', value: 2 });
         if (s.pumpMask & 1) pump1.checked = true;
         if (s.pumpMask & 2) pump2.checked = true;
-        pumpRow.appendChild(el('label', {}, 'Pump: '));
+        pumpRow.appendChild(el('label', {}, 'Top fill pump: '));
         pumpRow.appendChild(pump1);
-        pumpRow.appendChild(el('label', {}, 'Pump 1'));
+        pumpRow.appendChild(el('label', {}, 'Left tank fill pump'));
         pumpRow.appendChild(pump2);
-        pumpRow.appendChild(el('label', {}, 'Pump 2'));
-
-        const actions = el('div', { className: 'row' });
+        pumpRow.appendChild(el('label', {}, 'Right tank fill pump'));
         const save = el('button', {}, 'Save');
         save.onclick = () => {
             const weekdays = Array.from(dayGrid.querySelectorAll('input[type=checkbox]')).reduce((acc, cb, i) => acc | (cb.checked ? (1 << i) : 0), 0);

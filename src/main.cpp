@@ -34,8 +34,10 @@ static EpeverService epever(modbus, rtc, gc::config::kModbusPollIntervalMs);
 
 static PumpScheduler scheduler(
     prefs,
-    gc::config::kPump1Pin,
-    gc::config::kPump2Pin,
+    gc::config::kLeftTankFillPumpPin,
+    gc::config::kRightTankFillPumpPin,
+    gc::config::kLeftTankWateringPumpPin,
+    gc::config::kRightTankWateringPumpPin,
     gc::config::kTopTankFullPin,
     gc::config::kLeftTankEmptyPin,
     gc::config::kLeftTankFullPin,
@@ -48,6 +50,9 @@ static DisplayManager display(
     gc::config::kLcdSckPin,
     gc::config::kLcdMosiPin,
     gc::config::kLcdCsPin);
+
+static PumpRuntimeStatus cachedPumpRuntime;
+static unsigned long lastPumpRuntimeRefreshMs = 0;
 
 static WebPortal portal(
     gc::config::kApName,
@@ -96,8 +101,15 @@ void setup()
 
     logStartupBanner();
 
-    if (gc::config::kPump1Pin == gc::config::kRs485TxPin || gc::config::kPump1Pin == gc::config::kRs485RxPin || gc::config::kPump1Pin == gc::config::kRs485DePin ||
-        gc::config::kPump2Pin == gc::config::kRs485TxPin || gc::config::kPump2Pin == gc::config::kRs485RxPin || gc::config::kPump2Pin == gc::config::kRs485DePin)
+    auto pinConflictsWithRs485 = [](int pin) -> bool
+    {
+        return pin >= 0 && (pin == gc::config::kRs485TxPin || pin == gc::config::kRs485RxPin || pin == gc::config::kRs485DePin);
+    };
+
+    if (pinConflictsWithRs485(gc::config::kLeftTankFillPumpPin) ||
+        pinConflictsWithRs485(gc::config::kRightTankFillPumpPin) ||
+        pinConflictsWithRs485(gc::config::kLeftTankWateringPumpPin) ||
+        pinConflictsWithRs485(gc::config::kRightTankWateringPumpPin))
     {
         Serial.println("Pin conflict detected between pump outputs and RS485 pins");
     }
@@ -130,8 +142,18 @@ void setup()
 
     scheduler.begin();
     Serial.printf("Schedules loaded: %u\n", scheduler.scheduleCount());
+    cachedPumpRuntime = scheduler.runtimeStatus(rtc);
+    lastPumpRuntimeRefreshMs = millis();
 
     display.begin();
+    display.update(
+        portal.isApActive(),
+        epever.data(),
+        cachedPumpRuntime,
+        epever.pvDailyWh(),
+        epever.pvMonthlyWh(),
+        epever.pvTotalWh(),
+        rtc);
     portal.begin();
     epever.refreshIfNeeded();
 
@@ -141,18 +163,27 @@ void setup()
 void loop()
 {
     portal.loop();
-    epever.refreshIfNeeded();
-    epever.updateEnergyCounters();
+
+    unsigned long nowMs = millis();
+    if (nowMs - lastPumpRuntimeRefreshMs >= 1000UL)
+    {
+        cachedPumpRuntime = scheduler.runtimeStatus(rtc);
+        lastPumpRuntimeRefreshMs = nowMs;
+    }
 
     display.update(
         portal.isApActive(),
         epever.data(),
-        scheduler.runtimeStatus(),
+        cachedPumpRuntime,
         epever.pvDailyWh(),
         epever.pvMonthlyWh(),
         epever.pvTotalWh(),
         rtc);
 
     scheduler.loop(rtc, epever.data());
+
+    // Keep the UI loop responsive even when Modbus polling blocks on timeouts.
+    epever.refreshIfNeeded();
+    epever.updateEnergyCounters();
     delay(10);
 }

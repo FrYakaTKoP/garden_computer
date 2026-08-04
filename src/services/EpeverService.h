@@ -30,6 +30,8 @@ private:
 
     unsigned long lastPollMs_;
     unsigned long lastDataMs_;
+    unsigned long nextPollAllowedMs_;
+    uint8_t consecutivePollFailures_;
 
     EpeverTracerData data_;
 
@@ -47,5 +49,6 @@ private:
 
     static uint32_t modbusU32LowHigh(const uint16_t *registers, uint16_t startIndex);
     bool poll(EpeverTracerData &fresh);
+    static uint32_t failureBackoffMs(uint8_t failureCount);
 };
 }

@@ -64,7 +64,7 @@ void ModbusRtuClient::serialPrintHexBuffer(const uint8_t *buffer, size_t len) co
 bool ModbusRtuClient::readInputRegisters(uint16_t startRegister, uint16_t registerCount, uint16_t *registers)
 {
     ensureMutex();
-    if (mutex_ == nullptr || xSemaphoreTake(mutex_, pdMS_TO_TICKS(500)) != pdTRUE)
+    if (mutex_ == nullptr || xSemaphoreTake(mutex_, pdMS_TO_TICKS(50)) != pdTRUE)
     {
         if (debug_)
             Serial.println("Modbus mutex timeout (read)");
@@ -222,7 +222,7 @@ bool ModbusRtuClient::readInputRegisters(uint16_t startRegister, uint16_t regist
 bool ModbusRtuClient::writeMultipleRegisters(uint16_t startRegister, uint16_t registerCount, const uint16_t *registers)
 {
     ensureMutex();
-    if (mutex_ == nullptr || xSemaphoreTake(mutex_, pdMS_TO_TICKS(500)) != pdTRUE)
+    if (mutex_ == nullptr || xSemaphoreTake(mutex_, pdMS_TO_TICKS(50)) != pdTRUE)
     {
         if (debug_)
             Serial.println("Modbus mutex timeout (write)");

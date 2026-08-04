@@ -54,8 +54,15 @@ struct ActiveRun
 
 struct PumpRuntimeStatus
 {
-    bool newPumpsEnabled = false;
-    uint8_t batteryFullThresholdPct = 80;
+    bool fillPump1Enabled = true;
+    bool fillPump2Enabled = true;
+    bool wateringPump1Enabled = false;
+    bool wateringPump2Enabled = false;
+    bool fillPump1Active = false;
+    bool fillPump2Active = false;
+    bool wateringPump1Active = false;
+    bool wateringPump2Active = false;
+    float pvVoltageThresholdV = 20.0f;
     uint32_t autonomousCycleMs = 60000;
     bool topTankFull = false;
     bool leftTankEmpty = false;
@@ -64,5 +71,7 @@ struct PumpRuntimeStatus
     bool rightTankFull = false;
     uint8_t autonomousPumpMask = 0;
     uint8_t scheduledPumpMask = 0;
+    String nextFillPump1;
+    String nextFillPump2;
 };
 }

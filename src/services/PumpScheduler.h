@@ -12,7 +12,18 @@ class RtcService;
 class PumpScheduler
 {
 public:
-    PumpScheduler(Preferences &prefs, int pump1Pin, int pump2Pin, int topTankFullPin, int leftTankEmptyPin, int leftTankFullPin, int rightTankEmptyPin, int rightTankFullPin, uint8_t maxSchedules, uint8_t maxActiveRuns);
+    PumpScheduler(Preferences &prefs,
+                  int leftTankFillPumpPin,
+                  int rightTankFillPumpPin,
+                  int leftTankWateringPumpPin,
+                  int rightTankWateringPumpPin,
+                  int topTankFullPin,
+                  int leftTankEmptyPin,
+                  int leftTankFullPin,
+                  int rightTankEmptyPin,
+                  int rightTankFullPin,
+                  uint8_t maxSchedules,
+                  uint8_t maxActiveRuns);
 
     void begin();
     void loop(RtcService &rtc, const EpeverTracerData &epeverData);
@@ -26,15 +37,20 @@ public:
     bool deleteSchedule(uint32_t id);
 
     uint8_t activePumpMask() const;
-    PumpRuntimeStatus runtimeStatus() const;
-    bool setNewPumpsEnabled(bool enabled);
-    bool setBatteryThresholdPct(uint8_t value);
+    PumpRuntimeStatus runtimeStatus(RtcService &rtc) const;
+    bool setFillPump1Enabled(bool enabled);
+    bool setFillPump2Enabled(bool enabled);
+    bool setWateringPump1Enabled(bool enabled);
+    bool setWateringPump2Enabled(bool enabled);
+    bool setPvVoltageThresholdV(float value);
     bool setAutonomousCycleMs(uint32_t value);
 
 private:
     Preferences &prefs_;
-    int pump1Pin_;
-    int pump2Pin_;
+    int leftTankFillPumpPin_;
+    int rightTankFillPumpPin_;
+    int leftTankWateringPumpPin_;
+    int rightTankWateringPumpPin_;
     int topTankFullPin_;
     int leftTankEmptyPin_;
     int leftTankFullPin_;
@@ -47,8 +63,11 @@ private:
     ActiveRun activeRuns_[4];
     uint8_t scheduleCount_;
     uint32_t nextId_;
-    bool newPumpsEnabled_;
-    uint8_t batteryThresholdPct_;
+    bool fillPump1Enabled_;
+    bool fillPump2Enabled_;
+    bool wateringPump1Enabled_;
+    bool wateringPump2Enabled_;
+    float pvVoltageThresholdV_;
     uint32_t autonomousCycleMs_;
     bool topTankFull_;
     bool leftTankEmpty_;
@@ -70,6 +89,8 @@ private:
 
     int findScheduleIndex(uint32_t id) const;
     void setPumpPins();
+    uint8_t fillActivePumpMask() const;
+    uint8_t wateringActivePumpMask() const;
     void updateOutputs();
     void activatePumpMask(uint8_t mask, uint32_t durationMs, uint32_t schedId);
     void pumpTick();
@@ -81,5 +102,6 @@ private:
     void updateAutonomousLogic(const EpeverTracerData &epeverData);
     void setAutonomousPumpOutput(bool on, uint8_t pumpMask);
     bool readSwitchState(int pin) const;
+    String nextScheduleLabel(uint8_t pumpMask, RtcService &rtc) const;
 };
 }

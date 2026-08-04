@@ -11,14 +11,16 @@ static constexpr uint8_t kDnsPort = 53;
 static constexpr uint32_t kApTimeoutMs = 15UL * 60UL * 1000UL;
 
 static constexpr int kRestartApButtonPin = 0;
-static constexpr int kPump1Pin = 37;
-static constexpr int kPump2Pin = 38;
+static constexpr int kLeftTankFillPumpPin = 37;
+static constexpr int kRightTankFillPumpPin = 38;
+static constexpr int kLeftTankWateringPumpPin = -1;
+static constexpr int kRightTankWateringPumpPin = -1;
 static constexpr int kTopTankFullPin = -1;
 static constexpr int kLeftTankEmptyPin = -1;
 static constexpr int kLeftTankFullPin = -1;
 static constexpr int kRightTankEmptyPin = -1;
 static constexpr int kRightTankFullPin = -1;
-static constexpr uint8_t kAutonomousPumpBatteryThresholdPct = 80;
+static constexpr float kAutonomousPumpPvVoltageThresholdV = 20.0f;
 static constexpr uint32_t kAutonomousPumpCycleMs = 60000UL;
 
 static constexpr int kI2cSdaPin = 8;
@@ -36,7 +38,7 @@ static constexpr uint8_t kModbusSlaveAddress = 0x01;
 static constexpr uint32_t kModbusBaudRate = 115200;
 static constexpr uint32_t kModbusPollIntervalMs = 2000UL;
 static constexpr uint32_t kModbusResponseTimeoutMs = 250UL;
-static constexpr bool kModbusDebugSerial = true;
+static constexpr bool kModbusDebugSerial = false;
 
 #ifndef RTC_ENABLED_DEFAULT
 #define RTC_ENABLED_DEFAULT 1

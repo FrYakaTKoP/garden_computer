@@ -75,6 +75,58 @@ header p {
   line-height: 1.25;
 }
 
+.water-card {
+  overflow: hidden;
+}
+
+.tank-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.tank-box {
+  background: linear-gradient(180deg, rgba(24, 37, 29, 0.95), rgba(18, 27, 22, 0.98));
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px 8px 12px;
+  min-height: 92px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+}
+
+.tank-box.top {
+  grid-column: 1 / -1;
+  min-height: 66px;
+}
+
+.tank-title {
+  font-size: 0.82rem;
+  color: var(--muted);
+  font-weight: 800;
+  letter-spacing: 0.08em;
+}
+
+.tank-state-row {
+  font-size: 1.05rem;
+  font-weight: 800;
+  line-height: 1.1;
+}
+
+.tank-detail {
+  font-size: 0.88rem;
+  color: var(--text);
+  line-height: 1.25;
+}
+
+.tank-state {
+  font-size: 1.25rem;
+  font-weight: 800;
+  line-height: 1.05;
+}
+
 .powerflow {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -274,6 +326,20 @@ select {
 
   .day-grid {
     grid-template-columns: repeat(2, minmax(90px, 1fr));
+  }
+
+  .tank-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .tank-box.top {
+    grid-column: auto;
+    min-height: auto;
+  }
+
+  .tank-box {
+    min-height: auto;
+    gap: 4px;
   }
 
   .table-wrap table,

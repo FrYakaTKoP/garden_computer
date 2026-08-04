@@ -13,6 +13,8 @@ EpeverService::EpeverService(ModbusRtuClient &modbus, RtcService &rtc, uint32_t 
       pollIntervalMs_(pollIntervalMs),
       lastPollMs_(0),
       lastDataMs_(0),
+    nextPollAllowedMs_(0),
+    consecutivePollFailures_(0),
       energyFromController_(false),
       pvDailyWh_(0.0f),
       pvMonthlyWh_(0.0f),
@@ -35,6 +37,12 @@ float EpeverService::pvTotalWh() const { return pvTotalWh_; }
 uint32_t EpeverService::modbusU32LowHigh(const uint16_t *registers, uint16_t startIndex)
 {
     return static_cast<uint32_t>(registers[startIndex]) | (static_cast<uint32_t>(registers[startIndex + 1]) << 16);
+}
+
+uint32_t EpeverService::failureBackoffMs(uint8_t failureCount)
+{
+    uint8_t shift = failureCount > 6 ? 6 : failureCount;
+    return 1000UL << shift;
 }
 
 bool EpeverService::poll(EpeverTracerData &fresh)
@@ -98,6 +106,13 @@ bool EpeverService::poll(EpeverTracerData &fresh)
 void EpeverService::refreshIfNeeded()
 {
     unsigned long nowMs = millis();
+    if (nowMs < nextPollAllowedMs_)
+    {
+        if (nowMs - lastDataMs_ > 10000UL)
+            data_.valid = false;
+        return;
+    }
+
     if (nowMs - lastPollMs_ < pollIntervalMs_)
     {
         if (nowMs - lastDataMs_ > 10000UL)
@@ -111,8 +126,14 @@ void EpeverService::refreshIfNeeded()
     {
         data_ = fresh;
         lastDataMs_ = nowMs;
+        consecutivePollFailures_ = 0;
+        nextPollAllowedMs_ = nowMs;
         return;
     }
+
+    if (consecutivePollFailures_ < 250)
+        consecutivePollFailures_++;
+    nextPollAllowedMs_ = nowMs + failureBackoffMs(consecutivePollFailures_);
 
     if (nowMs - lastDataMs_ > 10000UL)
         data_.valid = false;

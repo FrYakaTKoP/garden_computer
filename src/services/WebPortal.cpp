@@ -106,10 +106,9 @@ void WebPortal::initFileServer()
 
 void WebPortal::apiStatus(AsyncWebServerRequest *request)
 {
-    epever_.refreshIfNeeded();
     const EpeverTracerData &data = epever_.data();
 
-    DynamicJsonDocument doc(640);
+    DynamicJsonDocument doc(768);
 
     String rtcDisplay = "";
     bool rtcReadOk = false;
@@ -140,17 +139,28 @@ void WebPortal::apiStatus(AsyncWebServerRequest *request)
     doc["pump1Active"] = (activeMask & 1) != 0;
     doc["pump2Active"] = (activeMask & 2) != 0;
 
-    const PumpRuntimeStatus runtime = scheduler_.runtimeStatus();
-    doc["newPumpsEnabled"] = runtime.newPumpsEnabled;
-    doc["batteryThresholdPct"] = runtime.batteryFullThresholdPct;
+    const PumpRuntimeStatus runtime = scheduler_.runtimeStatus(rtc_);
+    doc["fillPump1Enabled"] = runtime.fillPump1Enabled;
+    doc["fillPump2Enabled"] = runtime.fillPump2Enabled;
+    doc["wateringPump1Enabled"] = runtime.wateringPump1Enabled;
+    doc["wateringPump2Enabled"] = runtime.wateringPump2Enabled;
+    doc["fillPump1Active"] = runtime.fillPump1Active;
+    doc["fillPump2Active"] = runtime.fillPump2Active;
+    doc["wateringPump1Active"] = runtime.wateringPump1Active;
+    doc["wateringPump2Active"] = runtime.wateringPump2Active;
+    doc["pvVoltageThresholdV"] = runtime.pvVoltageThresholdV;
     doc["autonomousCycleMs"] = runtime.autonomousCycleMs;
     doc["topTankFull"] = runtime.topTankFull;
     doc["leftTankEmpty"] = runtime.leftTankEmpty;
     doc["leftTankFull"] = runtime.leftTankFull;
     doc["rightTankEmpty"] = runtime.rightTankEmpty;
     doc["rightTankFull"] = runtime.rightTankFull;
+    doc["fillPumpMask"] = runtime.scheduledPumpMask;
+    doc["wateringPumpMask"] = runtime.autonomousPumpMask;
     doc["autonomousPumpMask"] = runtime.autonomousPumpMask;
     doc["scheduledPumpMask"] = runtime.scheduledPumpMask;
+    doc["nextFillPump1"] = runtime.nextFillPump1;
+    doc["nextFillPump2"] = runtime.nextFillPump2;
 
     doc["apActive"] = apActive_;
     doc["ssid"] = ssid();
@@ -334,14 +344,42 @@ void WebPortal::handleRtcConfig(AsyncWebServerRequest *request)
 void WebPortal::handlePumpConfig(AsyncWebServerRequest *request)
 {
     bool changed = false;
-    if (request->hasArg("enabled"))
+    if (request->hasArg("fillPump1Enabled"))
     {
-        scheduler_.setNewPumpsEnabled(request->arg("enabled").toInt() != 0);
+        scheduler_.setFillPump1Enabled(request->arg("fillPump1Enabled").toInt() != 0);
         changed = true;
     }
-    if (request->hasArg("threshold"))
+    if (request->hasArg("fillPump2Enabled"))
     {
-        scheduler_.setBatteryThresholdPct(static_cast<uint8_t>(request->arg("threshold").toInt()));
+        scheduler_.setFillPump2Enabled(request->arg("fillPump2Enabled").toInt() != 0);
+        changed = true;
+    }
+    if (request->hasArg("enabled"))
+    {
+        const bool enabled = request->arg("enabled").toInt() != 0;
+        scheduler_.setWateringPump1Enabled(enabled);
+        scheduler_.setWateringPump2Enabled(enabled);
+        changed = true;
+    }
+    if (request->hasArg("wateringPump1Enabled"))
+    {
+        scheduler_.setWateringPump1Enabled(request->arg("wateringPump1Enabled").toInt() != 0);
+        changed = true;
+    }
+    if (request->hasArg("wateringPump2Enabled"))
+    {
+        scheduler_.setWateringPump2Enabled(request->arg("wateringPump2Enabled").toInt() != 0);
+        changed = true;
+    }
+    if (request->hasArg("pvThresholdV"))
+    {
+        scheduler_.setPvVoltageThresholdV(request->arg("pvThresholdV").toFloat());
+        changed = true;
+    }
+    else if (request->hasArg("threshold"))
+    {
+        // Backward compatibility with older clients that posted "threshold".
+        scheduler_.setPvVoltageThresholdV(request->arg("threshold").toFloat());
         changed = true;
     }
     if (request->hasArg("cycleMs"))
@@ -353,10 +391,21 @@ void WebPortal::handlePumpConfig(AsyncWebServerRequest *request)
     DynamicJsonDocument doc(256);
     doc["ok"] = 1;
     doc["changed"] = changed;
-    const PumpRuntimeStatus runtime = scheduler_.runtimeStatus();
-    doc["newPumpsEnabled"] = runtime.newPumpsEnabled;
-    doc["batteryThresholdPct"] = runtime.batteryFullThresholdPct;
+    const PumpRuntimeStatus runtime = scheduler_.runtimeStatus(rtc_);
+    doc["fillPump1Enabled"] = runtime.fillPump1Enabled;
+    doc["fillPump2Enabled"] = runtime.fillPump2Enabled;
+    doc["wateringPump1Enabled"] = runtime.wateringPump1Enabled;
+    doc["wateringPump2Enabled"] = runtime.wateringPump2Enabled;
+    doc["fillPump1Active"] = runtime.fillPump1Active;
+    doc["fillPump2Active"] = runtime.fillPump2Active;
+    doc["wateringPump1Active"] = runtime.wateringPump1Active;
+    doc["wateringPump2Active"] = runtime.wateringPump2Active;
+    doc["fillPumpMask"] = runtime.scheduledPumpMask;
+    doc["wateringPumpMask"] = runtime.autonomousPumpMask;
+    doc["pvVoltageThresholdV"] = runtime.pvVoltageThresholdV;
     doc["autonomousCycleMs"] = runtime.autonomousCycleMs;
+    doc["nextFillPump1"] = runtime.nextFillPump1;
+    doc["nextFillPump2"] = runtime.nextFillPump2;
 
     String out;
     serializeJson(doc, out);
