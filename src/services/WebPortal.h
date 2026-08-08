@@ -11,12 +11,13 @@ namespace gc
 class RtcService;
 class EpeverService;
 class PumpScheduler;
+class SdLogger;
 
 class WebPortal
 {
 public:
     WebPortal(const char *apName, const char *apPassword, const IPAddress &apIp, uint8_t dnsPort, uint32_t apTimeoutMs, int restartButtonPin,
-              RtcService &rtc, EpeverService &epever, PumpScheduler &scheduler);
+              RtcService &rtc, EpeverService &epever, PumpScheduler &scheduler, SdLogger &logger);
 
     void begin();
     void loop();
@@ -41,6 +42,7 @@ private:
     RtcService &rtc_;
     EpeverService &epever_;
     PumpScheduler &scheduler_;
+    SdLogger &logger_;
 
     void startAP();
     void stopAP();
@@ -49,6 +51,8 @@ private:
     void setupServerRoutes();
 
     void apiStatus(AsyncWebServerRequest *request);
+    void apiListLogs(AsyncWebServerRequest *request);
+    void apiGetLog(AsyncWebServerRequest *request);
     void apiListSchedules(AsyncWebServerRequest *request);
     void apiGetSchedule(AsyncWebServerRequest *request);
 
@@ -60,5 +64,6 @@ private:
     void handleSyncRtcToEpever(AsyncWebServerRequest *request);
     void handleRtcConfig(AsyncWebServerRequest *request);
     void handlePumpConfig(AsyncWebServerRequest *request);
+    void handleLoggingConfig(AsyncWebServerRequest *request);
 };
 }

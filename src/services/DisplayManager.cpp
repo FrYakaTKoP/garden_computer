@@ -202,7 +202,7 @@ void DisplayManager::drawWaterPumpScreen(const PumpRuntimeStatus &status, const 
     drawTankBox(63, 16, 64, 46, "RIGHT TANK", status.rightTankEmpty ? "EMPTY" : "OK", rightFillValue, rightWaterValue, rightNextValue, 3, 1);
 }
 
-void DisplayManager::drawEnergyWifiScreen(bool apActive, float pvDailyWh, float pvMonthlyWh, float pvTotalWh)
+void DisplayManager::drawEnergyWifiScreen(bool apActive, bool sdWritable, float pvDailyWh, float pvMonthlyWh, float pvTotalWh)
 {
     char value[24];
     lcd_.setFont(u8g2_font_timR08_tf);
@@ -222,9 +222,10 @@ void DisplayManager::drawEnergyWifiScreen(bool apActive, float pvDailyWh, float 
     snprintf(value, sizeof(value), "%.2f kWh", pvTotalWh / 1000.0f);
     drawLabelValue(2, 36, "Total:", value);
     drawLabelValue(2, 48, "WiFi AP:", apActive ? "ON" : "OFF");
+    drawLabelValue(2, 60, "SD:", sdWritable ? "OK" : "ERROR");
 }
 
-void DisplayManager::update(bool apActive, const EpeverTracerData &epeverData, const PumpRuntimeStatus &pumpRuntime, float pvDailyWh, float pvMonthlyWh, float pvTotalWh, RtcService &rtc)
+void DisplayManager::update(bool apActive, bool sdWritable, const EpeverTracerData &epeverData, const PumpRuntimeStatus &pumpRuntime, float pvDailyWh, float pvMonthlyWh, float pvTotalWh, RtcService &rtc)
 {
     unsigned long nowMs = millis();
 
@@ -248,7 +249,7 @@ void DisplayManager::update(bool apActive, const EpeverTracerData &epeverData, c
     if (activeScreen_ == 0)
         drawPowerFlowScreen(epeverData, rtc);
     else if (activeScreen_ == 1)
-        drawEnergyWifiScreen(apActive, pvDailyWh, pvMonthlyWh, pvTotalWh);
+        drawEnergyWifiScreen(apActive, sdWritable, pvDailyWh, pvMonthlyWh, pvTotalWh);
     else
         drawWaterPumpScreen(pumpRuntime, epeverData, rtc);
     lcd_.sendBuffer();

@@ -15,7 +15,7 @@ public:
     DisplayManager(int sckPin, int mosiPin, int csPin);
 
     void begin();
-    void update(bool apActive, const EpeverTracerData &epeverData, const PumpRuntimeStatus &pumpRuntime, float pvDailyWh, float pvMonthlyWh, float pvTotalWh, RtcService &rtc);
+    void update(bool apActive, bool sdWritable, const EpeverTracerData &epeverData, const PumpRuntimeStatus &pumpRuntime, float pvDailyWh, float pvMonthlyWh, float pvTotalWh, RtcService &rtc);
 
 private:
     U8G2_ST7920_128X64_F_SW_SPI lcd_;
@@ -29,7 +29,7 @@ private:
     static uint8_t batterySocForIcon(uint16_t soc);
 
     void drawBatteryIcon(int16_t x, int16_t baselineY, uint8_t soc);
-    void drawEnergyWifiScreen(bool apActive, float pvDailyWh, float pvMonthlyWh, float pvTotalWh);
+    void drawEnergyWifiScreen(bool apActive, bool sdWritable, float pvDailyWh, float pvMonthlyWh, float pvTotalWh);
     void drawWaterPumpScreen(const PumpRuntimeStatus &status, const EpeverTracerData &epeverData, RtcService &rtc);
     void drawPowerFlowScreen(const EpeverTracerData &epeverData, RtcService &rtc);
     void drawFlowChevrons(int16_t x, int16_t y, bool enabled);

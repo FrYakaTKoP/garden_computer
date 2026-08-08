@@ -34,6 +34,13 @@ static constexpr int kLcdCsPin = 10;
 static constexpr int kLcdMosiPin = 11;
 static constexpr int kLcdSckPin = 12;
 
+static constexpr int kSdCsPin = 2;
+static constexpr int kSdMosiPin = 41;
+static constexpr int kSdMisoPin = 42;
+static constexpr int kSdSckPin = 40;
+static constexpr uint32_t kSdLogIntervalMs = 10UL * 60UL * 1000UL;
+static constexpr bool kSdDebugSerial = true;
+
 static constexpr uint8_t kModbusSlaveAddress = 0x01;
 static constexpr uint32_t kModbusBaudRate = 115200;
 static constexpr uint32_t kModbusPollIntervalMs = 2000UL;

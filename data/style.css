@@ -198,6 +198,44 @@ button.secondary {
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
 }
 
+.history-panel {
+  width: min(100%, 900px);
+}
+
+.history-chart {
+  display: block;
+  height: 360px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.history-chart-scroll {
+  overflow-x: auto;
+  overflow-y: hidden;
+  max-width: 100%;
+  padding-bottom: 6px;
+}
+
+.chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin: 8px 0;
+}
+
+.solar-series {
+  color: #e4b44e;
+}
+
+.voltage-series {
+  color: #64c7be;
+}
+
+.current-series {
+  color: #d777aa;
+}
+
 .table-wrap {
   overflow-x: visible;
 }
@@ -326,6 +364,10 @@ select {
 
   .day-grid {
     grid-template-columns: repeat(2, minmax(90px, 1fr));
+  }
+
+  .history-chart {
+    height: 280px;
   }
 
   .tank-grid {

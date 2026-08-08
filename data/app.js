@@ -37,6 +37,12 @@
         return `${value.toFixed(2)}${unit}`;
     }
 
+    function formatBytes(bytes) {
+        const value = Number(bytes || 0);
+        if (value < 1024 * 1024) return `${(value / 1024).toFixed(0)} KB`;
+        return `${(value / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+    }
+
     function tankBox(title, state, lines, extraClass = '') {
         const box = el('div', { className: `tank-box ${extraClass}`.trim() });
         box.appendChild(el('div', { className: 'tank-title' }, title));
@@ -132,6 +138,12 @@
             clock.textContent = 'RTC unavailable';
             clock.classList.add('muted');
         }
+
+        const sdStatus = document.getElementById('sdStatus');
+        const sdState = data.sdWritable ? 'OK' : (data.sdMounted ? 'ERROR' : 'NO CARD');
+        const intervalSeconds = Math.round(Number(data.sdIntervalMs || 0) / 1000);
+        sdStatus.textContent = `Status: ${sdState}\nInterval: ${intervalSeconds}s\nUsed: ${formatBytes(data.sdUsedBytes)} / ${formatBytes(data.sdTotalBytes)}\nQueue: ${data.sdQueuedRecords || 0}  Dropped: ${data.sdDroppedRecords || 0}`;
+        sdStatus.classList.toggle('muted', !data.sdWritable);
     }
 
     function splitRtcString(value) {
@@ -146,6 +158,190 @@
             year: parseInt(dateMatch[3], 10),
             time: timePart
         };
+    }
+
+    function parseLogTimestamp(value) {
+        const text = String(value || '');
+        if (text.length !== 14) return null;
+        const year = Number(text.slice(0, 4));
+        const month = Number(text.slice(4, 6)) - 1;
+        const day = Number(text.slice(6, 8));
+        const hour = Number(text.slice(8, 10));
+        const minute = Number(text.slice(10, 12));
+        const second = Number(text.slice(12, 14));
+        const date = new Date(year, month, day, hour, minute, second);
+        return Number.isNaN(date.getTime()) ? null : date;
+    }
+
+    function dateFromLogFilename(filename) {
+        const match = /^(\d{4})(\d{2})(\d{2})\.ndjson$/i.exec(filename || '');
+        if (!match) return null;
+        return new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]), 0, 0, 0);
+    }
+
+    function parseLog(text, filename) {
+        const records = [];
+        let invalidLines = 0;
+        const fallbackStart = dateFromLogFilename(filename);
+        text.split('\n').forEach((line, index) => {
+            if (!line.trim()) return;
+            try {
+                const row = JSON.parse(line);
+                const time = row.tv ? parseLogTimestamp(row.t) : null;
+                const fallbackTime = fallbackStart ? new Date(fallbackStart.getTime() + index * 10 * 60 * 1000) : null;
+                if (time && Array.isArray(row.p) && Array.isArray(row.b)) {
+                    records.push({ time, solarW: Number(row.p[2]) / 100, batteryV: Number(row.b[0]) / 100, loadA: Array.isArray(row.l) ? Number(row.l[1]) / 100 : 0 });
+                } else if (fallbackTime && Array.isArray(row.p) && Array.isArray(row.b)) {
+                    records.push({ time: fallbackTime, solarW: Number(row.p[2]) / 100, batteryV: Number(row.b[0]) / 100, loadA: Array.isArray(row.l) ? Number(row.l[1]) / 100 : 0 });
+                } else {
+                    invalidLines++;
+                }
+            } catch (_) {
+                // A trailing partial record after power loss is intentionally ignored.
+                invalidLines++;
+            }
+        });
+        return { records, invalidLines };
+    }
+
+    function downsample(records, maxPoints = 720) {
+        if (records.length <= maxPoints) return records;
+        const step = records.length / maxPoints;
+        const output = [];
+        for (let index = 0; index < maxPoints; index++) output.push(records[Math.floor(index * step)]);
+        return output;
+    }
+
+    function drawHistory(canvas, sourceRecords) {
+        const records = downsample(sourceRecords);
+        canvas.style.width = `${Math.max(1440, records.length * 12 + 140)}px`;
+        const rect = canvas.getBoundingClientRect();
+        const pixelRatio = window.devicePixelRatio || 1;
+        canvas.width = Math.max(1, Math.floor(rect.width * pixelRatio));
+        canvas.height = Math.max(1, Math.floor(rect.height * pixelRatio));
+        const context = canvas.getContext('2d');
+        context.scale(pixelRatio, pixelRatio);
+        const width = rect.width;
+        const height = rect.height;
+        context.clearRect(0, 0, width, height);
+        if (!records.length) {
+            context.fillStyle = '#8fa59b';
+            context.fillText('No RTC-stamped records in this log.', 20, 30);
+            return;
+        }
+
+        const margin = { left: 50, right: 100, top: 18, bottom: 38 };
+        const chartWidth = width - margin.left - margin.right;
+        const chartHeight = height - margin.top - margin.bottom;
+        const start = records[0].time.getTime();
+        const end = records[records.length - 1].time.getTime();
+        const solarMax = Math.max(10, ...records.map(row => row.solarW));
+        const batteryMin = Math.floor(Math.min(...records.map(row => row.batteryV)) - 0.5);
+        const batteryMax = Math.ceil(Math.max(...records.map(row => row.batteryV)) + 0.5);
+        const loadMax = Math.max(0.5, ...records.map(row => row.loadA));
+        const range = Math.max(1, end - start);
+        const x = row => margin.left + ((row.time.getTime() - start) / range) * chartWidth;
+        const solarY = row => margin.top + chartHeight - (row.solarW / solarMax) * chartHeight;
+        const batteryY = row => margin.top + chartHeight - ((row.batteryV - batteryMin) / Math.max(0.1, batteryMax - batteryMin)) * chartHeight;
+        const loadY = row => margin.top + chartHeight - (row.loadA / loadMax) * chartHeight;
+
+        context.strokeStyle = '#2a3a31';
+        context.lineWidth = 1;
+        for (let row = 0; row <= 4; row++) {
+            const y = margin.top + chartHeight * row / 4;
+            context.beginPath(); context.moveTo(margin.left, y); context.lineTo(width - margin.right, y); context.stroke();
+        }
+        context.font = '12px Arial';
+        context.fillStyle = '#e4b44e';
+        context.fillText(`0 W`, 4, margin.top + chartHeight + 4);
+        context.fillText(`${solarMax.toFixed(0)} W`, 4, margin.top + 4);
+        context.fillStyle = '#64c7be';
+        context.fillText(`${batteryMin.toFixed(1)} V`, width - 94, margin.top + chartHeight + 4);
+        context.fillText(`${batteryMax.toFixed(1)} V`, width - 94, margin.top + 4);
+        context.fillStyle = '#d777aa';
+        context.fillText(`0 A`, width - 42, margin.top + chartHeight + 4);
+        context.fillText(`${loadMax.toFixed(1)} A`, width - 42, margin.top + 4);
+
+        const firstHour = new Date(records[0].time);
+        firstHour.setMinutes(0, 0, 0);
+        if (firstHour.getTime() < start) firstHour.setHours(firstHour.getHours() + 1);
+        for (let hour = new Date(firstHour); hour.getTime() <= end; hour.setHours(hour.getHours() + 1)) {
+            const hourX = margin.left + ((hour.getTime() - start) / range) * chartWidth;
+            context.strokeStyle = '#2a3a31';
+            context.beginPath(); context.moveTo(hourX, margin.top); context.lineTo(hourX, margin.top + chartHeight); context.stroke();
+            context.fillStyle = '#8fa59b';
+            context.fillText(String(hour.getHours()).padStart(2, '0'), hourX - 6, height - 10);
+        }
+
+        const drawLine = (color, y) => {
+            context.strokeStyle = color;
+            context.lineWidth = 2;
+            context.beginPath();
+            records.forEach((row, index) => index === 0 ? context.moveTo(x(row), y(row)) : context.lineTo(x(row), y(row)));
+            context.stroke();
+        };
+        drawLine('#e4b44e', solarY);
+        drawLine('#64c7be', batteryY);
+        drawLine('#d777aa', loadY);
+    }
+
+    function openHistory() {
+        const wrap = document.getElementById('settingswrap');
+        wrap.className = 'modal';
+        wrap.style.display = 'flex';
+        wrap.innerHTML = '';
+        wrap.onclick = event => { if (event.target === wrap) wrap.style.display = 'none'; };
+
+        const panel = el('div', { className: 'modal-panel history-panel' });
+        const title = el('h3', {}, 'Solar and Battery History');
+        const controls = el('div', { className: 'row' });
+        const fileSelect = el('select', {});
+        const load = el('button', {}, 'Load day');
+        const close = el('button', { className: 'secondary' }, 'Close');
+        const message = el('p', { className: 'muted' }, 'Loading available log days...');
+        const legend = el('p', { className: 'chart-legend' },
+            el('span', { className: 'solar-series' }, 'Solar power (W)'),
+            el('span', { className: 'voltage-series' }, 'Battery voltage (V)'),
+            el('span', { className: 'current-series' }, 'Load current (A)'));
+        const canvas = el('canvas', { className: 'history-chart' });
+        const chartScroll = el('div', { className: 'history-chart-scroll' }, canvas);
+        close.onclick = () => { wrap.style.display = 'none'; };
+        load.onclick = () => {
+            if (!fileSelect.value) return;
+            message.textContent = 'Loading log...';
+            fetch(`/api/log-file?name=${encodeURIComponent(fileSelect.value)}`).then(response => {
+                if (!response.ok) throw new Error('log unavailable');
+                return response.text();
+            }).then(text => {
+                const parsed = parseLog(text, fileSelect.value);
+                if (!parsed.records.length) {
+                    const preview = text.slice(0, 80).replace(/\s+/g, ' ');
+                    message.textContent = `No valid records: received ${text.length} bytes, ${parsed.invalidLines} invalid lines. ${preview}`;
+                    drawHistory(canvas, []);
+                    return;
+                }
+                message.textContent = `${parsed.records.length} records shown from ${fileSelect.value}`;
+                drawHistory(canvas, parsed.records);
+            }).catch(() => { message.textContent = 'Unable to load this log.'; });
+        };
+        controls.appendChild(fileSelect); controls.appendChild(load); controls.appendChild(close);
+        panel.appendChild(title); panel.appendChild(controls); panel.appendChild(message); panel.appendChild(legend); panel.appendChild(chartScroll);
+        wrap.appendChild(panel);
+
+        api('/api/logs').then(data => {
+            const files = (data.files || []).sort((left, right) => right.name.localeCompare(left.name));
+            files.forEach(file => {
+                const label = /^\d{8}\.ndjson$/i.test(file.name) ? file.name.slice(0, 8) : `${file.name} (RTC unavailable)`;
+                fileSelect.appendChild(el('option', { value: file.name }, `${label} (${formatBytes(file.size)})`));
+            });
+            if (!files.length) {
+                message.textContent = 'No log files are available yet.';
+                load.disabled = true;
+                return;
+            }
+            message.textContent = 'Choose a day to view its stored measurements.';
+            load.click();
+        }).catch(() => { message.textContent = 'SD log listing is unavailable.'; load.disabled = true; });
     }
 
     let statusTimer = null;
@@ -271,6 +467,18 @@
         cycleRow.appendChild(el('label', {}, 'Cycle time ms: '));
         cycleRow.appendChild(cycleInput);
 
+        const loggingRow = el('div', { className: 'row' });
+        const loggingIntervalInput = el('input', { type: 'number', min: 10000, max: 3600000, step: 1000, value: 600000 });
+        loggingRow.appendChild(el('label', {}, 'SD logging interval (ms): '));
+        loggingRow.appendChild(loggingIntervalInput);
+
+        const loggingSave = el('button', {}, 'Save logging interval');
+        loggingSave.onclick = () => {
+            const params = new URLSearchParams();
+            params.set('intervalMs', String(parseInt(loggingIntervalInput.value, 10) || 600000));
+            fetch('/api/logging/config', { method: 'POST', body: params }).then(() => reload()).catch(() => alert('Unable to save logging interval.'));
+        };
+
         const pumpSave = el('button', {}, 'Save pump settings');
         pumpSave.onclick = () => {
             const params = new URLSearchParams();
@@ -322,6 +530,7 @@
             pump2Enabled.checked = !!data.wateringPump2Enabled;
             thresholdInput.value = String(Number(data.pvVoltageThresholdV || 20));
             cycleInput.value = String(parseInt(data.autonomousCycleMs, 10) || 60000);
+            loggingIntervalInput.value = String(parseInt(data.sdIntervalMs, 10) || 600000);
             const current = splitRtcString(data.rtcDisplay || '');
             if (current) {
                 dayInput.value = String(current.day).padStart(2, '0');
@@ -352,6 +561,8 @@
         pumpSection.appendChild(thresholdRow);
         pumpSection.appendChild(cycleRow);
         pumpSection.appendChild(pumpSave);
+        pumpSection.appendChild(loggingRow);
+        pumpSection.appendChild(loggingSave);
         panel.appendChild(title);
         panel.appendChild(hint);
         panel.appendChild(liveValue);
@@ -461,6 +672,7 @@
     document.getElementById('add').onclick = () => openForm(null);
     document.getElementById('refresh').onclick = () => reload();
     document.getElementById('settings').onclick = () => openSettings();
+    document.getElementById('history').onclick = () => openHistory();
     reload();
     startStatusPolling();
 })();

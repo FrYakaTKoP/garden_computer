@@ -6,11 +6,12 @@
 #include "services/EpeverService.h"
 #include "services/PumpScheduler.h"
 #include "services/RtcService.h"
+#include "services/SdLogger.h"
 
 namespace gc
 {
 WebPortal::WebPortal(const char *apName, const char *apPassword, const IPAddress &apIp, uint8_t dnsPort, uint32_t apTimeoutMs, int restartButtonPin,
-                     RtcService &rtc, EpeverService &epever, PumpScheduler &scheduler)
+                     RtcService &rtc, EpeverService &epever, PumpScheduler &scheduler, SdLogger &logger)
     : apName_(apName),
       apPassword_(apPassword),
       apIp_(apIp),
@@ -22,7 +23,8 @@ WebPortal::WebPortal(const char *apName, const char *apPassword, const IPAddress
       apStartMillis_(0),
       rtc_(rtc),
       epever_(epever),
-      scheduler_(scheduler)
+    scheduler_(scheduler),
+    logger_(logger)
 {
 }
 
@@ -108,7 +110,7 @@ void WebPortal::apiStatus(AsyncWebServerRequest *request)
 {
     const EpeverTracerData &data = epever_.data();
 
-    DynamicJsonDocument doc(768);
+    DynamicJsonDocument doc(1152);
 
     String rtcDisplay = "";
     bool rtcReadOk = false;
@@ -165,6 +167,18 @@ void WebPortal::apiStatus(AsyncWebServerRequest *request)
     doc["apActive"] = apActive_;
     doc["ssid"] = ssid();
 
+    const SdLoggerStatus sd = logger_.status();
+    doc["sdMounted"] = sd.mounted;
+    doc["sdWritable"] = sd.writable;
+    doc["sdIntervalMs"] = sd.intervalMs;
+    doc["sdQueuedRecords"] = sd.queuedRecords;
+    doc["sdDroppedRecords"] = sd.droppedRecords;
+    doc["sdWriteFailures"] = sd.writeFailures;
+    doc["sdLastWriteUptimeSeconds"] = sd.lastWriteUptimeSeconds;
+    doc["sdTotalBytes"] = static_cast<double>(sd.totalBytes);
+    doc["sdUsedBytes"] = static_cast<double>(sd.usedBytes);
+    doc["sdError"] = sd.error;
+
     doc["rtcEnabled"] = rtc_.enabled();
     doc["rtcDebug"] = rtc_.debug();
     doc["rtcPresent"] = rtc_.present();
@@ -179,6 +193,21 @@ void WebPortal::apiStatus(AsyncWebServerRequest *request)
     String out;
     serializeJson(doc, out);
     request->send(200, "application/json", out);
+}
+
+void WebPortal::apiListLogs(AsyncWebServerRequest *request)
+{
+    request->send(200, "application/json", logger_.listLogFilesJson());
+}
+
+void WebPortal::apiGetLog(AsyncWebServerRequest *request)
+{
+    if (!request->hasArg("name"))
+    {
+        request->send(400, "application/json", "{\"error\":\"Missing log name\"}");
+        return;
+    }
+    logger_.sendLogFile(request, request->arg("name"));
 }
 
 void WebPortal::apiListSchedules(AsyncWebServerRequest *request)
@@ -412,10 +441,28 @@ void WebPortal::handlePumpConfig(AsyncWebServerRequest *request)
     request->send(200, "application/json", out);
 }
 
+void WebPortal::handleLoggingConfig(AsyncWebServerRequest *request)
+{
+    if (request->hasArg("intervalMs"))
+        logger_.setIntervalMs(request->arg("intervalMs").toInt());
+
+    const SdLoggerStatus sd = logger_.status();
+    DynamicJsonDocument doc(192);
+    doc["ok"] = 1;
+    doc["intervalMs"] = sd.intervalMs;
+    String out;
+    serializeJson(doc, out);
+    request->send(200, "application/json", out);
+}
+
 void WebPortal::setupServerRoutes()
 {
     server_.on("/api/status", HTTP_GET, [this](AsyncWebServerRequest *r)
                { apiStatus(r); });
+    server_.on("/api/logs", HTTP_GET, [this](AsyncWebServerRequest *r)
+               { apiListLogs(r); });
+    server_.on("/api/log-file", HTTP_GET, [this](AsyncWebServerRequest *r)
+               { apiGetLog(r); });
     server_.on("/api/schedules", HTTP_GET, [this](AsyncWebServerRequest *r)
                { apiListSchedules(r); });
     server_.on("/api/schedules/get", HTTP_GET, [this](AsyncWebServerRequest *r)
@@ -442,6 +489,8 @@ void WebPortal::setupServerRoutes()
                { handlePumpConfig(r); });
     server_.on("/api/pumps/config", HTTP_POST, [this](AsyncWebServerRequest *r)
                { handlePumpConfig(r); });
+    server_.on("/api/logging/config", HTTP_POST, [this](AsyncWebServerRequest *r)
+               { handleLoggingConfig(r); });
 
     initFileServer();
 }

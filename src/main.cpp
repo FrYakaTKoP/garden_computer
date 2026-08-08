@@ -8,6 +8,7 @@
 #include "services/ModbusRtuClient.h"
 #include "services/PumpScheduler.h"
 #include "services/RtcService.h"
+#include "services/SdLogger.h"
 #include "services/WebPortal.h"
 
 using namespace gc;
@@ -51,6 +52,15 @@ static DisplayManager display(
     gc::config::kLcdMosiPin,
     gc::config::kLcdCsPin);
 
+static SdLogger logger(
+    prefs,
+    gc::config::kSdSckPin,
+    gc::config::kSdMosiPin,
+    gc::config::kSdMisoPin,
+    gc::config::kSdCsPin,
+    gc::config::kSdLogIntervalMs,
+    gc::config::kSdDebugSerial);
+
 static PumpRuntimeStatus cachedPumpRuntime;
 static unsigned long lastPumpRuntimeRefreshMs = 0;
 
@@ -63,7 +73,8 @@ static WebPortal portal(
     gc::config::kRestartApButtonPin,
     rtc,
     epever,
-    scheduler);
+    scheduler,
+    logger);
 
 static void waitForUsbSerial(unsigned long timeoutMs = gc::config::kUsbCdcStartupWaitMs)
 {
@@ -120,6 +131,7 @@ void setup()
         Serial.println("LittleFS mounted");
 
     prefs.begin("gc", false);
+    logger.begin();
 
     rtc.begin();
     rtc.init();
@@ -148,6 +160,7 @@ void setup()
     display.begin();
     display.update(
         portal.isApActive(),
+        logger.status().writable,
         epever.data(),
         cachedPumpRuntime,
         epever.pvDailyWh(),
@@ -173,6 +186,7 @@ void loop()
 
     display.update(
         portal.isApActive(),
+        logger.status().writable,
         epever.data(),
         cachedPumpRuntime,
         epever.pvDailyWh(),
@@ -185,5 +199,26 @@ void loop()
     // Keep the UI loop responsive even when Modbus polling blocks on timeouts.
     epever.refreshIfNeeded();
     epever.updateEnergyCounters();
+
+    if (logger.isDue(nowMs))
+    {
+        LogSnapshot snapshot;
+        snapshot.uptimeSeconds = nowMs / 1000UL;
+        snapshot.epever = epever.data();
+        snapshot.pumps = scheduler.runtimeStatus(rtc);
+        snapshot.apActive = portal.isApActive();
+        snapshot.pvDailyWh = epever.pvDailyWh();
+        snapshot.pvMonthlyWh = epever.pvMonthlyWh();
+        snapshot.pvTotalWh = epever.pvTotalWh();
+        snapshot.hasRtc = rtc.enabled() && rtc.readDateTime(snapshot.rtc);
+        snapshot.includeEnergy = snapshot.hasRtc && logger.shouldIncludeDailyEnergy(snapshot.rtc);
+
+        if (logger.enqueue(snapshot))
+        {
+            logger.markLogged(nowMs);
+            if (snapshot.includeEnergy)
+                logger.markDailyEnergyLogged(snapshot.rtc);
+        }
+    }
     delay(10);
 }
