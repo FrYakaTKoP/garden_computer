@@ -31,7 +31,7 @@ uint8_t dayOfWeekFromDate(uint16_t year, uint8_t month, uint8_t day)
     uint32_t m = month;
     uint32_t d = day;
     uint32_t t = (y + y / 4 - y / 100 + y / 400 + (13 * m + 8) / 5 + d) % 7;
-    return static_cast<uint8_t>((t + 5) % 7);
+    return static_cast<uint8_t>((t + 6) % 7);
 }
 
 uint32_t daysSince2000(uint16_t year, uint8_t month, uint8_t day)
@@ -69,9 +69,13 @@ String formatRtcTimeInput(const Ds1307Time &now)
 
 String formatRtcBottomLine(const Ds1307Time &now)
 {
-    char buf[24];
-    snprintf(buf, sizeof(buf), "%02u.%02u.%04u %02u:%02u",
-             now.day, now.month, now.year, now.hour, now.minute);
+    static const char *const weekdayNames[] = {
+        "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"};
+
+    char buf[40];
+    uint8_t weekdayIndex = dayOfWeekFromDate(now.year, now.month, now.day);
+    snprintf(buf, sizeof(buf), "%02u.%02u.%04u %02u:%02u %s",
+             now.day, now.month, now.year, now.hour, now.minute, weekdayNames[weekdayIndex]);
     return String(buf);
 }
 }
